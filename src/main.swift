@@ -15,6 +15,7 @@ struct Config: Codable {
     var maxLightness = 0.56
     var maxChroma = 0.05               // keeps the tint muted
     var smoothingSeconds = 1.2
+    var fadeSeconds = 0.35             // fade-in of the large color area (0 = instant, more = smoother)
     var sampleFPS = 10.0
     var displays = "builtin"           // "builtin": only the MacBook's own display; "all": every display
     var instantSpaceSwitch = false     // make full-screen Space switching instant (removes the slide seam/delay)
@@ -47,6 +48,7 @@ extension Config {
         maxLightness = try c.decodeIfPresent(Double.self, forKey: .maxLightness) ?? maxLightness
         maxChroma = try c.decodeIfPresent(Double.self, forKey: .maxChroma) ?? maxChroma
         smoothingSeconds = try c.decodeIfPresent(Double.self, forKey: .smoothingSeconds) ?? smoothingSeconds
+        fadeSeconds = try c.decodeIfPresent(Double.self, forKey: .fadeSeconds) ?? fadeSeconds
         sampleFPS = try c.decodeIfPresent(Double.self, forKey: .sampleFPS) ?? sampleFPS
         displays = try c.decodeIfPresent(String.self, forKey: .displays) ?? displays
         instantSpaceSwitch = try c.decodeIfPresent(Bool.self, forKey: .instantSpaceSwitch) ?? instantSpaceSwitch
@@ -247,6 +249,17 @@ final class OverlayView: NSView {
     }
 
     func setColor(_ c: OKLab) { shape.fillColor = ColorMath.cgColor(c); band.backgroundColor = shape.fillColor }
+
+    // Fade the letterbox color in (not the notch band), so the large area eases from the system's
+    // black to our color instead of popping once the full-screen zoom finishes.
+    func fadeInLetterbox(_ seconds: Double) {
+        shape.removeAnimation(forKey: "fade")
+        let a = CABasicAnimation(keyPath: "opacity")
+        a.fromValue = 0; a.toValue = 1; a.duration = seconds
+        a.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        shape.opacity = 1
+        shape.add(a, forKey: "fade")
+    }
 
     func setBand(_ r: CGRect) { band.frame = r }
 
@@ -690,7 +703,10 @@ final class Session {
             plate.orderFrontRegardless()
             let others = Display.allSpaceIDs().subtracting(plateSpaces)
             SLSRemoveWindowsFromSpaces(cid, [plate.windowNumber] as CFArray, Array(others) as CFArray)
-            plate.alphaValue = 1
+            // Ease the backdrop from the system's black to our color instead of popping.
+            if cfg.fadeSeconds > 0.01 {
+                NSAnimationContext.runAnimationGroup { ctx in ctx.duration = cfg.fadeSeconds; plate.animator().alphaValue = 1 }
+            } else { plate.alphaValue = 1 }
         }
         show(why: "full-screen Space \(ids.sorted())")
     }
@@ -803,6 +819,7 @@ final class Session {
         if native { barRects = []; view?.setRects([]) }
         panel.orderFrontRegardless()
         panel.alphaValue = 1
+        if cfg.fadeSeconds > 0.01 { view?.fadeInLetterbox(cfg.fadeSeconds) }
         sampler?.start()
         if let pid = front?.processIdentifier { sampler?.focus(pid: pid) }
     }
