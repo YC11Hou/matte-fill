@@ -1,0 +1,13 @@
+{
+  "name": "Matte",
+  "identifier": "io.github.matte-fill",
+  "version": "1.0.0",
+  "description": "Full screen on the displays Matte targets: paints mpv's letterbox with the adaptive color computed by the matte-fill agent, and pushes bars baked into the video out of view.",
+  "author": {
+    "name": "matte-fill"
+  },
+  "entry": "main.js",
+  "permissions": [
+    "file-system"
+  ]
+}
