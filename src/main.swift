@@ -981,7 +981,7 @@ final class Controller: NSObject {
         let body = sessions.map(\.stateJSON).joined(separator: ",")
         guard body != lastWritten else { return }
         lastWritten = body
-        let json = "{\"displays\":\"\(cfg.displays)\",\"screens\":[\(body)],\"t\":\(Date().timeIntervalSince1970)}"
+        let json = "{\"displays\":\"\(cfg.displays)\",\"fade\":\(cfg.fadeSeconds),\"screens\":[\(body)],\"t\":\(Date().timeIntervalSince1970)}"
         try? FileManager.default.createDirectory(at: Config.stateFile.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? json.write(to: Config.stateFile, atomically: true, encoding: .utf8)
     }

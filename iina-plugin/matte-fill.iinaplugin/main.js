@@ -154,15 +154,33 @@ function setGeometry(g) {
 
 // MARK: main loop
 
-let fsNow = false, lastReport = 0, lastKey = "";
+// Small color helpers so the letterbox background can ease from black to the target color.
+function hexRGB(h) { h = h.replace("#", ""); return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)]; }
+function rgbHex(r, g, b) { const f = (x) => Math.max(0, Math.min(255, Math.round(x))).toString(16).padStart(2, "0"); return "#" + f(r) + f(g) + f(b); }
+function mix(a, b, t) { const A = hexRGB(a), B = hexRGB(b); return rgbHex(A[0] + (B[0] - A[0]) * t, A[1] + (B[1] - A[1]) * t, A[2] + (B[2] - A[2]) * t); }
+
+const ZOOM_MS = 450;   // IINA freezes mpv for roughly this long during the full-screen zoom
+let fsNow = false, fsPrev = false, fsEdge = 0, lastReport = 0, lastKey = "";
 function update() {
   if (!orig) captureOrig();
+  const now = Date.now();
   const st = readState();
   const scr = core.window.loaded ? targetScreen(st) : null;
   fsNow = !!(core.window.loaded && core.window.fullscreen);
-  // Live agent color in full screen; before that, the color of the latest analyzed frame so the
-  // first full-screen frame already matches.
-  const bg = !scr ? orig.background : (scr.active || !media || !media.color ? scr.color : media.color);
+  if (fsNow && !fsPrev) fsEdge = now;   // full-screen rising edge
+  fsPrev = fsNow;
+  // The letterbox is black during the zoom (mpv frozen, the window hasn't covered the bars yet). Only
+  // after the zoom (~ZOOM_MS) is mpv rendering the bars again — start the dark->light fade there so it
+  // is actually seen, over `fade` seconds, instead of a pop.
+  const target = !scr ? orig.background : (scr.active || !media || !media.color ? scr.color : media.color);
+  let bg = target;
+  if (scr && fsNow && target) {
+    const fade = (st && st.fade > 0) ? st.fade * 1000 : 0;
+    const el = now - fsEdge - ZOOM_MS;
+    if (fade <= 0 || el >= fade) bg = target;
+    else if (el < 0) bg = "#000000";                       // still zooming (frozen; invisible)
+    else { const p = el / fade; bg = mix("#000000", target, p * p * (3 - 2 * p)); }   // smoothstep
+  }
   if (bg && bg !== appliedBg) { mpv.set("background", bg); appliedBg = bg; }
   const g = scr ? geometry(scr) : null;
   setGeometry(g);
@@ -171,7 +189,7 @@ function update() {
   else if (!g && ownKeepaspect && !fsNow) { mpv.set("keepaspect", false); ownKeepaspect = false; }
 
   // Written at once when full screen flips (the agent shows the notch band from it) and every second.
-  const now = Date.now(), cur = (core.window.screens || []).find((x) => x.current);
+  const cur = (core.window.screens || []).find((x) => x.current);
   const key = `${fsNow}|${!!scr}`;
   if (now - lastReport >= 1000 || key !== lastKey) {
     lastReport = now; lastKey = key;
