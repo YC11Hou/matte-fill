@@ -852,8 +852,7 @@ final class Session {
 enum SwooshControl {
     static let marker = Config.dir.appendingPathComponent("instant-original.json")
     private static let toggles: [(domain: String, key: String)] = [
-        ("com.apple.dock", "workspaces-swoosh-animation-off"),   // no Space slide
-        ("com.apple.universalaccess", "reduceMotion"),           // no full-screen zoom animation
+        ("com.apple.dock", "workspaces-swoosh-animation-off"),   // no Space slide (keeps app animations)
     ]
 
     private static func value(_ d: String, _ k: String) -> Bool? { UserDefaults(suiteName: d)?.object(forKey: k) as? Bool }
