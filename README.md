@@ -62,12 +62,23 @@ matte-fill --displays all       # 所有屏幕都生效（外接显示器、合�
 
 没有源头设定可改的 app，由常驻程序检测黑边（交界行 ≥85% 纯黑，且上下 / 左右两侧都能找到），再用覆盖层上色。只采样该 app 自己的窗口，所以系统 HUD 不会触发挖洞；但 app 自己在黑边里弹出的控件仍然会挖出一个洞。长期方向是逐个找各 app 的源头设定。
 
+## 瞬切：去掉全屏切换的黑缝和延迟
+
+原生全屏切换时，macOS 把两个 Space 横向滑动，中间那道系统黑缝我们的窗口进不去。把 Dock 的滑动动画关掉，切换就变成瞬切，黑缝和延迟都没了：
+
+```bash
+matte-fill --instant on    # 全屏切换变瞬切（存下原值）
+matte-fill --instant off   # 还原
+```
+
+改的是 Dock 的用户偏好 `workspaces-swoosh-animation-off`，**不注入任何进程**，且**完全可逆**：开启时存原值，agent 退出（正常关闭 / 崩溃 / 卸载）都自动还原成系统默认，崩溃后下次启动也会自检还原。应用和还原各重启一次 Dock（窗口和全屏都不受影响）。注意这是 Dock 的全局设置，外接屏的 Space 切换也会跟着变瞬切——没有只对单屏的版本。
+
 ## 配置
 
 `~/.config/matte-fill/config.json`，所有字段都可以省略，改完 1 秒内生效：
 
 ```json
-{ "displays": "builtin", "fallbackColor": "#3A3733", "adaptive": true, "coverBars": true,
+{ "displays": "builtin", "instantSpaceSwitch": false, "fallbackColor": "#3A3733", "adaptive": true, "coverBars": true,
   "minLightness": 0.34, "maxLightness": 0.56, "maxChroma": 0.05, "smoothingSeconds": 1.2, "sampleFPS": 10 }
 ```
 

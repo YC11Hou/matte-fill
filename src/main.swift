@@ -17,6 +17,7 @@ struct Config: Codable {
     var smoothingSeconds = 1.2
     var sampleFPS = 10.0
     var displays = "builtin"           // "builtin": only the MacBook's own display; "all": every display
+    var instantSpaceSwitch = false     // make full-screen Space switching instant (removes the slide seam/delay)
 
     static let dir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".config/matte-fill")
@@ -48,6 +49,7 @@ extension Config {
         smoothingSeconds = try c.decodeIfPresent(Double.self, forKey: .smoothingSeconds) ?? smoothingSeconds
         sampleFPS = try c.decodeIfPresent(Double.self, forKey: .sampleFPS) ?? sampleFPS
         displays = try c.decodeIfPresent(String.self, forKey: .displays) ?? displays
+        instantSpaceSwitch = try c.decodeIfPresent(Bool.self, forKey: .instantSpaceSwitch) ?? instantSpaceSwitch
     }
 }
 
@@ -729,7 +731,9 @@ final class Session {
         let v = OverlayView(frame: NSRect(origin: .zero, size: f.size))
         p.contentView = v
         v.setColor(current)
-        bandRect = CGRect(x: 0, y: 0, width: f.width, height: screen.safeAreaInsets.top)
+        // Overlap the content below by a few points: the notch band and whatever colors the area
+        // under it meet exactly at safeAreaInsets.top, and rounding there leaves a 1px black seam.
+        bandRect = CGRect(x: 0, y: 0, width: f.width, height: screen.safeAreaInsets.top + (screen.safeAreaInsets.top > 0 ? 4 : 0))
         v.setBand(bandRect)
         v.setRects([])
         p.alphaValue = 0
@@ -825,6 +829,57 @@ final class Session {
     }
 }
 
+// MARK: - Space-switch animation (optional, fully reversible)
+
+// Turns the full-screen Space slide into an instant cut by toggling Dock's swoosh animation, so no
+// black seam and no delay appear during the switch. The original value is saved before the first
+// change and restored on quit; if the process ever exits without restoring, the marker file lets the
+// next launch reconcile. It is a global Dock setting (there is no per-display one), and applying or
+// restoring it relaunches Dock, which keeps every window and full-screen session.
+enum SwooshControl {
+    static let marker = Config.dir.appendingPathComponent("swoosh-original.json")
+    private static let domain = "com.apple.dock", key = "workspaces-swoosh-animation-off"
+
+    private static func current() -> Bool? { UserDefaults(suiteName: domain)?.object(forKey: key) as? Bool }
+
+    private static func defaults(_ args: [String]) {
+        let p = Process(); p.launchPath = "/usr/bin/defaults"; p.arguments = args
+        try? p.run(); p.waitUntilExit()
+    }
+    private static func restartDock() {
+        let p = Process(); p.launchPath = "/usr/bin/killall"; p.arguments = ["Dock"]
+        try? p.run(); p.waitUntilExit()
+    }
+
+    static var changed: Bool { FileManager.default.fileExists(atPath: marker.path) }
+
+    // Make switching instant, remembering the original value exactly once.
+    static func enable() {
+        if changed { return }                 // already ours; nothing to do (avoids repeated Dock restarts)
+        let existed = current() != nil
+        let orig = "{\"existed\":\(existed),\"value\":\(current() ?? false)}"
+        try? FileManager.default.createDirectory(at: Config.dir, withIntermediateDirectories: true)
+        try? orig.write(to: marker, atomically: true, encoding: .utf8)
+        defaults(["write", domain, key, "-bool", "true"])
+        restartDock()
+        NSLog("matte-fill: instant space switch ON (was existed=\(existed) value=\(current() ?? false))")
+    }
+
+    // Put back exactly what was there before we touched it.
+    static func restore() {
+        guard let data = try? Data(contentsOf: marker),
+              let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        if o["existed"] as? Bool == true, let v = o["value"] as? Bool {
+            defaults(["write", domain, key, "-bool", v ? "true" : "false"])
+        } else {
+            defaults(["delete", domain, key])
+        }
+        try? FileManager.default.removeItem(at: marker)
+        restartDock()
+        NSLog("matte-fill: instant space switch restored")
+    }
+}
+
 // MARK: - Controller
 
 final class Controller: NSObject {
@@ -880,6 +935,8 @@ final class Controller: NSObject {
             rebuild()
         }
         ShotAnalyzer.poll(cfg: cfg)
+        if cfg.instantSpaceSwitch { SwooshControl.enable() }
+        else if SwooshControl.changed { SwooshControl.restore() }
     }
 
     // The IINA plugin reads this: per target display, its frame, whether we are active there and the color.
@@ -924,6 +981,19 @@ if let i = args.firstIndex(of: "--displays") {
 }
 if args.contains("--request-capture") {
     print("granted:", CGRequestScreenCaptureAccess())
+    exit(0)
+}
+// Turn instant Space switching on or off; the running agent applies or restores it within a second.
+if let i = args.firstIndex(of: "--instant") {
+    guard i + 1 < args.count, ["on", "off"].contains(args[i + 1]) else {
+        print("usage: matte-fill --instant on|off"); exit(2)
+    }
+    var obj = (try? Data(contentsOf: Config.file)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+    obj["instantSpaceSwitch"] = args[i + 1] == "on"
+    try? FileManager.default.createDirectory(at: Config.dir, withIntermediateDirectories: true)
+    let data = try! JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
+    try! data.write(to: Config.file, options: .atomic)
+    print("instantSpaceSwitch:", args[i + 1])
     exit(0)
 }
 // Offline self-test of the IINA shot analysis: prints the JSON verdict the plugin would receive.
@@ -972,6 +1042,17 @@ if args.contains("--preview"), let screen = Display.targetScreens(Config.load())
     app.run()
 }   // no Dock icon, never takes focus
 NSLog("matte-fill: started (capture access: \(CGPreflightScreenCaptureAccess()))")
+// Restore any system setting we changed (instant Space switch) when the agent is asked to quit, so
+// stopping the agent always returns the system to how it was.
+atexit { if SwooshControl.changed { SwooshControl.restore() } }
+var signalSources: [DispatchSourceSignal] = []
+for sig in [SIGTERM, SIGINT] {
+    signal(sig, SIG_IGN)
+    let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    src.setEventHandler { if SwooshControl.changed { SwooshControl.restore() }; exit(0) }
+    src.resume()
+    signalSources.append(src)
+}
 let controller = Controller()
 controller.run()
 app.run()
