@@ -26,14 +26,14 @@ By default this only applies to the MacBook's built‑in display; external displ
 
 ## Instant Space switch — remove the transition seam and delay
 
-When entering a native full‑screen Space, macOS slides the two Spaces past each other, and the black seam the compositor shows between them during that slide is drawn by WindowServer, where our windows can't reach. Turning off Dock's slide animation makes the switch an instant cut, so the seam and the delay are gone:
+Our own colored strip reaches full‑screen size instantly, but the app's window still animates into full screen a beat behind it, and the compositor shows a black seam during the Space slide. Two global toggles make the whole switch instant, so the app content keeps up with the strip:
 
 ```bash
-matte-fill --instant on    # instant full-screen switching (original value saved)
+matte-fill --instant on    # instant full-screen switching (original values saved)
 matte-fill --instant off   # restore
 ```
 
-This toggles Dock's `workspaces-swoosh-animation-off` user preference — **no process is injected** — and is **fully reversible**: the original value is saved on enable and restored whenever the agent stops (normal quit, crash, or uninstall), with a marker file so the next launch reconciles after a crash. Enabling and restoring each relaunch Dock (windows and full‑screen sessions are preserved). Note this is a global Dock setting: Space switching on external displays becomes instant too; there is no per‑display equivalent.
+This turns on Dock's `workspaces-swoosh-animation-off` (removes the Space slide and its seam) and Reduce Motion (removes the window's zoom‑into‑full‑screen animation). **No process is injected**, and it is **fully reversible**: each original value is saved on enable and restored whenever the agent stops (normal quit, crash, or uninstall), with a marker file so the next launch reconciles after a crash. Enabling and restoring relaunch Dock (windows and full‑screen sessions are preserved). Note these are global settings — external displays and other animations are affected too; there is no per‑display equivalent.
 
 ## How it works
 

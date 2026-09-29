@@ -842,19 +842,21 @@ final class Session {
     }
 }
 
-// MARK: - Space-switch animation (optional, fully reversible)
+// MARK: - Instant full-screen switching (optional, fully reversible)
 
-// Turns the full-screen Space slide into an instant cut by toggling Dock's swoosh animation, so no
-// black seam and no delay appear during the switch. The original value is saved before the first
-// change and restored on quit; if the process ever exits without restoring, the marker file lets the
-// next launch reconcile. It is a global Dock setting (there is no per-display one), and applying or
-// restoring it relaunches Dock, which keeps every window and full-screen session.
+// Makes entering/leaving full screen instant, so app content reaches full size as fast as our own
+// strip instead of a beat behind it. Two global toggles: Dock's swoosh removes the Space slide (and
+// its black seam); Reduce Motion removes the window's zoom-into-full-screen animation. Each original
+// value is saved before the first change and put back on quit; a marker file lets the next launch
+// reconcile after a crash. Applying/restoring relaunches Dock (windows and full screen are kept).
 enum SwooshControl {
-    static let marker = Config.dir.appendingPathComponent("swoosh-original.json")
-    private static let domain = "com.apple.dock", key = "workspaces-swoosh-animation-off"
+    static let marker = Config.dir.appendingPathComponent("instant-original.json")
+    private static let toggles: [(domain: String, key: String)] = [
+        ("com.apple.dock", "workspaces-swoosh-animation-off"),   // no Space slide
+        ("com.apple.universalaccess", "reduceMotion"),           // no full-screen zoom animation
+    ]
 
-    private static func current() -> Bool? { UserDefaults(suiteName: domain)?.object(forKey: key) as? Bool }
-
+    private static func value(_ d: String, _ k: String) -> Bool? { UserDefaults(suiteName: d)?.object(forKey: k) as? Bool }
     private static func defaults(_ args: [String]) {
         let p = Process(); p.launchPath = "/usr/bin/defaults"; p.arguments = args
         try? p.run(); p.waitUntilExit()
@@ -866,30 +868,36 @@ enum SwooshControl {
 
     static var changed: Bool { FileManager.default.fileExists(atPath: marker.path) }
 
-    // Make switching instant, remembering the original value exactly once.
+    // Turn both toggles on, remembering each original value exactly once.
     static func enable() {
-        if changed { return }                 // already ours; nothing to do (avoids repeated Dock restarts)
-        let existed = current() != nil
-        let orig = "{\"existed\":\(existed),\"value\":\(current() ?? false)}"
+        if changed { return }                 // already ours; avoids repeated Dock restarts
+        var orig: [String: [String: Bool]] = [:]
+        for t in toggles {
+            let v = value(t.domain, t.key)
+            orig["\(t.domain)/\(t.key)"] = ["existed": v != nil, "value": v ?? false]
+        }
         try? FileManager.default.createDirectory(at: Config.dir, withIntermediateDirectories: true)
-        try? orig.write(to: marker, atomically: true, encoding: .utf8)
-        defaults(["write", domain, key, "-bool", "true"])
+        if let d = try? JSONSerialization.data(withJSONObject: orig) { try? d.write(to: marker) }
+        for t in toggles { defaults(["write", t.domain, t.key, "-bool", "true"]) }
         restartDock()
-        NSLog("matte-fill: instant space switch ON (was existed=\(existed) value=\(current() ?? false))")
+        NSLog("matte-fill: instant switch ON")
     }
 
     // Put back exactly what was there before we touched it.
     static func restore() {
         guard let data = try? Data(contentsOf: marker),
-              let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-        if o["existed"] as? Bool == true, let v = o["value"] as? Bool {
-            defaults(["write", domain, key, "-bool", v ? "true" : "false"])
-        } else {
-            defaults(["delete", domain, key])
+              let o = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Bool]] else { return }
+        for t in toggles {
+            let e = o["\(t.domain)/\(t.key)"]
+            if e?["existed"] == true, let v = e?["value"] {
+                defaults(["write", t.domain, t.key, "-bool", v ? "true" : "false"])
+            } else {
+                defaults(["delete", t.domain, t.key])
+            }
         }
         try? FileManager.default.removeItem(at: marker)
         restartDock()
-        NSLog("matte-fill: instant space switch restored")
+        NSLog("matte-fill: instant switch restored")
     }
 }
 
