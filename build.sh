@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 APP="$HOME/Applications/Matte.app"
 LABEL="io.github.matte-fill"
 mkdir -p "$APP/Contents/MacOS" build
-swiftc -O -o build/matte-fill src/main.swift -framework Cocoa -framework ScreenCaptureKit
+swiftc -O -o build/matte-fill src/main.swift -framework Cocoa -framework ScreenCaptureKit -F /System/Library/PrivateFrameworks -framework SkyLight
 cp build/matte-fill "$APP/Contents/MacOS/matte-fill"
 cat > "$APP/Contents/Info.plist" <<PL
 <?xml version="1.0" encoding="UTF-8"?>

@@ -130,6 +130,8 @@ enum Palette {
 
 @_silgen_name("CGSMainConnectionID") func CGSMainConnectionID() -> Int32
 @_silgen_name("CGSCopyManagedDisplaySpaces") func CGSCopyManagedDisplaySpaces(_ cid: Int32) -> CFArray?
+@_silgen_name("SLSAddWindowsToSpaces") func SLSAddWindowsToSpaces(_ cid: Int32, _ windows: CFArray, _ spaces: CFArray)
+@_silgen_name("SLSRemoveWindowsFromSpaces") func SLSRemoveWindowsFromSpaces(_ cid: Int32, _ windows: CFArray, _ spaces: CFArray)
 
 enum Display {
     static func targetScreens(_ cfg: Config) -> [NSScreen] {
@@ -155,18 +157,26 @@ enum Display {
         return nil
     }
 
-    // A native full-screen Space (type 4) is current on the display, or a window outside the
-    // normal layer (e.g. IINA legacy full screen) covers the whole display.
-    static func fullScreenSpaceCount(_ screen: NSScreen) -> Int {
+    static func spaceID(_ s: [String: Any]) -> UInt64? {
+        (s["id64"] as? NSNumber)?.uint64Value ?? (s["ManagedSpaceID"] as? NSNumber)?.uint64Value
+    }
+
+    // IDs of the native full-screen Spaces (type 4) on the display.
+    static func fullScreenSpaceIDs(_ screen: NSScreen) -> Set<UInt64> {
         let did = id(of: screen)
         let uuid = CGDisplayCreateUUIDFromDisplayID(did).map { CFUUIDCreateString(nil, $0.takeRetainedValue()) as String } ?? ""
         let spaces = CGSCopyManagedDisplaySpaces(CGSMainConnectionID()) as? [[String: Any]] ?? []
         for d in spaces {
             let ident = d["Display Identifier"] as? String ?? ""
             guard ident.caseInsensitiveCompare(uuid) == .orderedSame || (ident == "Main" && (spaces.count == 1 || CGMainDisplayID() == did)) else { continue }
-            return (d["Spaces"] as? [[String: Any]] ?? []).filter { ($0["type"] as? Int) == 4 }.count
+            return Set((d["Spaces"] as? [[String: Any]] ?? []).filter { ($0["type"] as? Int) == 4 }.compactMap(spaceID))
         }
-        return 0
+        return []
+    }
+
+    static func allSpaceIDs() -> Set<UInt64> {
+        let spaces = CGSCopyManagedDisplaySpaces(CGSMainConnectionID()) as? [[String: Any]] ?? []
+        return Set(spaces.flatMap { ($0["Spaces"] as? [[String: Any]] ?? []).compactMap(spaceID) })
     }
 
     static func fullScreenReason(_ screen: NSScreen) -> String? {
@@ -610,6 +620,9 @@ final class Session {
     let displayID: CGDirectDisplayID
     var panel: OverlayPanel?
     var view: OverlayView?
+    var plate: OverlayPanel?
+    var plateSpaces = Set<UInt64>()
+    var knownFS = Set<UInt64>()
     var sampler: Sampler?
     var shown = false
     var current: OKLab
@@ -637,12 +650,19 @@ final class Session {
         hide()
         sampler?.stop(); sampler = nil
         panel?.orderOut(nil); panel = nil; view = nil
+        plate?.orderOut(nil); plate = nil
     }
 
     // A new full-screen Space appears as the zoom animation starts; show the band right then.
     func refresh() {
         let now = CACurrentMediaTime()
-        let n = Display.fullScreenSpaceCount(screen)
+        let ids = Display.fullScreenSpaceIDs(screen)
+        let fresh = ids.subtracting(knownFS)
+        knownFS = ids
+        plateSpaces.formIntersection(ids)
+        if !fresh.isEmpty { adopt(fresh) }
+        if plateSpaces.isEmpty, plate?.isVisible == true { plate?.orderOut(nil) }
+        let n = ids.count
         if n > fsSpaces { pendingUntil = now + 1.5 }
         if n < fsSpaces { pendingUntil = 0 }
         fsSpaces = n
@@ -651,6 +671,26 @@ final class Session {
         }
         else if now < pendingUntil { show(why: "full-screen transition") }
         else { hide() }
+    }
+
+    // A full-screen Space is empty (black) wherever its app window doesn't reach. Our plate and band
+    // become members of the Space the moment it exists, so the compositor draws them as part of it
+    // from its first frame, including the slide-in; the plate never belongs to a desktop Space.
+    private func adopt(_ ids: Set<UInt64>) {
+        guard let plate, let panel else { return }
+        let cid = CGSMainConnectionID(), spaces = Array(ids) as CFArray
+        plate.backgroundColor = NSColor(cgColor: ColorMath.cgColor(current)) ?? .black
+        SLSAddWindowsToSpaces(cid, [plate.windowNumber] as CFArray, spaces)
+        SLSAddWindowsToSpaces(cid, [panel.windowNumber] as CFArray, spaces)
+        plateSpaces.formUnion(ids)
+        if !plate.isVisible {
+            plate.alphaValue = 0
+            plate.orderFrontRegardless()
+            let others = Display.allSpaceIDs().subtracting(plateSpaces)
+            SLSRemoveWindowsFromSpaces(cid, [plate.windowNumber] as CFArray, Array(others) as CFArray)
+            plate.alphaValue = 1
+        }
+        show(why: "full-screen Space \(ids.sorted())")
     }
 
     // The IINA plugin reports full screen as its transition starts, before a Space appears (and legacy
@@ -694,6 +734,16 @@ final class Session {
         v.setRects([])
         p.alphaValue = 0
         panel = p; view = v
+        let pl = OverlayPanel(contentRect: f, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        pl.level = NSWindow.Level(rawValue: NSWindow.Level.normal.rawValue - 1)   // under the app and its popups
+        pl.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle]
+        pl.ignoresMouseEvents = true
+        pl.hasShadow = false
+        pl.hidesOnDeactivate = false
+        pl.isReleasedWhenClosed = false
+        pl.animationBehavior = .none
+        pl.setFrame(f, display: false)
+        plate = pl
         if cfg.adaptive || cfg.coverBars {
             let s = Sampler(cfg: cfg, bandFraction: Double(screen.safeAreaInsets.top / f.height), screenSize: f.size)
             s.onAnalysis = { [weak self] a in
@@ -758,6 +808,7 @@ final class Session {
                         a: current.a + (target.a - current.a) * k,
                         b: current.b + (target.b - current.b) * k)
         view?.setColor(current)
+        if plate?.isVisible == true { plate?.backgroundColor = NSColor(cgColor: ColorMath.cgColor(current)) ?? .black }
         let (r, g, b) = ColorMath.toSRGB(current)
         sampler?.tintBytes = (Int(r * 255 + 0.5), Int(g * 255 + 0.5), Int(b * 255 + 0.5))
         if let f = panel?.frame {
