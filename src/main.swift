@@ -785,7 +785,20 @@ final class Session {
             // and ease toward live samples instead of snapping.
             current = c; target = c; snapNext = false; view?.setColor(c)
         }
-        if let k = shownKey, let cached = barCache[k], !native { barRects = cached; view?.setRects(cached) }
+        if let k = shownKey, let cached = barCache[k], !native {
+            barRects = cached; view?.setRects(cached)   // same window as before: exact bars, no flash
+        } else if !native, CGPreflightScreenCaptureAccess() {
+            // No cached geometry: cover the whole screen with our color at once, so the app's black
+            // bars never show. The sampler carves the video region out on its first frame (~0.1 s),
+            // turning the old black->color jump into a color->video reveal. A safety timer clears the
+            // cover if no frame ever arrives, so a stalled capture can never hide the video.
+            let full = [CGRect(origin: .zero, size: screen.frame.size)]
+            barRects = full; view?.setRects(full)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard let self, self.shown, self.framesSinceShow == 0 else { return }
+                self.barRects = []; self.view?.setRects([])
+            }
+        }
         sampler?.barsEnabled = !native
         if native { barRects = []; view?.setRects([]) }
         panel.orderFrontRegardless()
