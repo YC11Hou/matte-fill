@@ -1,9 +1,10 @@
 // Fills the area around the picture inside mpv itself. `background` takes the agent's color on the
 // displays Matte targets; bars baked into the video are pushed out of view with VO geometry
-// (margins + zoom + pan), which never touches the filter chain or the hardware decoder. IINA keeps
-// mpv's keepaspect off while windowed, which disables all of that geometry, and turns it on
-// synchronously as full screen starts; so the geometry is set in advance and lands on the first
-// full-screen frame. Bars are measured from async screenshots that the matte-fill agent analyzes.
+// (margins + zoom + pan), which never touches the filter chain or the hardware decoder. This is the
+// window's steady state, not a full-screen reaction: IINA freezes mpv rendering for the whole
+// full-screen animation and stretches the last windowed frame, so that frame must already be matted.
+// IINA keeps mpv's keepaspect off while windowed (which disables the geometry); we turn it on.
+// Bars are measured from async screenshots that the matte-fill agent analyzes, and remembered per file.
 const { core, event, mpv, file, utils } = iina;
 
 const STATE = "~/Library/Caches/matte-fill/state.json";
@@ -18,7 +19,7 @@ function captureOrig() {
   orig = { background: mpv.getString("background") || "#000000" };
   GEOM.forEach((p) => { orig[p] = mpv.getNumber(p) || 0; });
 }
-let appliedBg = null, appliedGeom = null, lastError = null;
+let appliedBg = null, appliedGeom = null, ownKeepaspect = false, lastError = null;
 
 let stCache = null, stAt = 0;
 function readState() {
@@ -38,7 +39,7 @@ function targetScreen(st) {
                                 Math.abs(s.w - a.width) < 1 && Math.abs(s.h - a.height) < 1) || null;
 }
 
-// MARK: bar detection (per file: screenshots after 0.5/2/4/8/15 s of actual playback, so a resumed
+// MARK: bar detection (per file: screenshots after 0.2/1.5/4/8/15 s of actual playback, so a resumed
 // film is measured right away, plus one per 30 s of playback position)
 
 let media = null;
@@ -48,7 +49,7 @@ function hash(s) {
   return h.toString(36);
 }
 
-const EARLY_MS = [500, 2000, 4000, 8000, 15000];
+const EARLY_MS = [200, 1500, 4000, 8000, 15000];
 
 function shotTick() {
   const url = core.status.url;
@@ -56,6 +57,11 @@ function shotTick() {
   const now = Date.now();
   if (!media || media.url !== url) {
     media = { url, key: hash(url), n: 0, played: 0, early: 0, bins: {}, pending: {}, results: [], bars: null, color: null, at: now };
+    try {   // a file seen before starts fully matted, before its first frame
+      const saved = `${DATA}bars-${media.key}.json`;
+      if (file.exists(saved)) Object.assign(media, JSON.parse(file.read(saved)));
+    } catch (e) {}
+    aggregate();
   }
   const dt = now - media.at;
   media.at = now;
@@ -77,9 +83,9 @@ function shotTick() {
   media.pending[name] = now;
 }
 
-// Picks up the agent's analyses; bars are the per-side minimum over informative frames, so a dark
-// scene can only ever shrink them, and they apply once two frames agree.
+// Picks up the agent's analyses and remembers them for the file.
 function collect() {
+  let changed = false;
   for (const name of Object.keys(media.pending)) {
     const res = `${DATA}${name}.json`;
     if (!file.exists(res)) {
@@ -91,11 +97,19 @@ function collect() {
     try { r = JSON.parse(file.read(res)); } catch (e) {}
     file.delete(res);
     if (!r) continue;
-    media.results.push(r);
+    if (r.info) media.results.push({ top: r.top, bottom: r.bottom, left: r.left, right: r.right, info: true });
     if (r.color) media.color = r.color;
+    changed = true;
   }
+  if (!changed) return;
+  aggregate();
+  file.write(`${DATA}bars-${media.key}.json`, JSON.stringify({ results: media.results.slice(-MAX_SHOTS), color: media.color }));
+}
+
+// Bars are the per-side minimum over informative frames, so a dark scene can only ever shrink them.
+function aggregate() {
   const inf = media.results.filter((r) => r.info);
-  if (inf.length < 2) { media.bars = null; return; }
+  if (inf.length < 1) { media.bars = null; return; }
   const side = (k) => { const v = Math.min(...inf.map((r) => r[k])); return v >= 0.005 ? v : 0; };
   const b = { t: side("top"), b: side("bottom"), l: side("left"), r: side("right") };
   // Real bars are nearly always symmetric; a lopsided result is more likely a dark scene edge,
@@ -111,12 +125,12 @@ function geometry(scr) {
   const vp = mpv.getNative("video-out-params"), od = mpv.getNative("osd-dimensions");
   const bars = media && media.bars;
   if (!bars || !vp || !vp.dw || !vp.dh || !od || !od.w || !od.h || (vp.rotate || 0) % 180) return null;
-  // Final window aspect: native full screen sits below the camera housing; once a full-screen window
-  // has kept its size for 300 ms, the real window (e.g. legacy full screen) is authoritative.
+  // Windowed: fit the window exactly. Full screen: until the window has kept its size for 300 ms,
+  // assume native full screen (below the camera housing); then the real window is authoritative.
   const now = Date.now(), dims = `${od.w}x${od.h}`;
   if (dims !== lastDims) { lastDims = dims; dimsSince = now; }
   const cur = od.w / od.h;
-  const fin = fsNow && now - dimsSince >= 300 ? cur : scr.w / (scr.h - (scr.top || 0));
+  const fin = !fsNow || now - dimsSince >= 300 ? cur : scr.w / (scr.h - (scr.top || 0));
   const { t, b, l, r } = bars;
   const fx = 1 - l - r, fy = 1 - t - b, ca = (vp.dw / vp.dh) * fx / fy;
   // Clipping top/bottom bars needs area aspect >= content aspect, side bars the reverse; the window
@@ -140,7 +154,7 @@ function setGeometry(g) {
 
 // MARK: main loop
 
-let fsNow = false, lastReport = 0;
+let fsNow = false, lastReport = 0, lastKey = "";
 function update() {
   if (!orig) captureOrig();
   const st = readState();
@@ -150,15 +164,20 @@ function update() {
   // first full-screen frame already matches.
   const bg = !scr ? orig.background : (scr.active || !media || !media.color ? scr.color : media.color);
   if (bg && bg !== appliedBg) { mpv.set("background", bg); appliedBg = bg; }
-  const g = scr ? geometry(scr) : null;   // inert until IINA enables keepaspect for full screen
+  const g = scr ? geometry(scr) : null;
   setGeometry(g);
+  // IINA sets keepaspect=no on load and whenever it leaves full screen; while matting, keep it on.
+  if (g && !fsNow && (!ownKeepaspect || !mpv.getFlag("keepaspect"))) { mpv.set("keepaspect", true); ownKeepaspect = true; }
+  else if (!g && ownKeepaspect && !fsNow) { mpv.set("keepaspect", false); ownKeepaspect = false; }
 
-  const now = Date.now();
-  if (now - lastReport >= 1000) {
-    lastReport = now;
+  // Written at once when full screen flips (the agent shows the notch band from it) and every second.
+  const now = Date.now(), cur = (core.window.screens || []).find((x) => x.current);
+  const key = `${fsNow}|${!!scr}`;
+  if (now - lastReport >= 1000 || key !== lastKey) {
+    lastReport = now; lastKey = key;
     file.write(`${DATA}status.json`, JSON.stringify({
-      t: now, targeted: !!scr, fullscreen: fsNow, background: appliedBg, geometry: g, error: lastError,
-      bars: media && media.bars, shots: media ? media.n : 0,
+      t: now, targeted: !!scr, fullscreen: fsNow, screen: cur ? cur.frame : null, background: appliedBg,
+      geometry: g, error: lastError, bars: media && media.bars, shots: media ? media.n : 0,
       analyzed: media ? media.results.length : 0,
     }));
   }
@@ -171,4 +190,4 @@ function guarded(fn) {
 event.on("iina.window-loaded", guarded(update));
 event.on("iina.window-screen.changed", guarded(update));
 setInterval(guarded(shotTick), 250);
-setInterval(guarded(update), 30);   // catches full screen as the transition starts
+setInterval(guarded(update), 30);

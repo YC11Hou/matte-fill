@@ -544,6 +544,7 @@ enum ShotAnalyzer {
             guard let attrs = try? fm.attributesOfItem(atPath: url.path),
                   let mtime = attrs[.modificationDate] as? Date, Date().timeIntervalSince(mtime) > 0.3 else { continue }
             if let json = analyze(url, cfg: cfg) {
+                NSLog("matte-fill: shot \(name) -> \(json)")
                 try? json.write(to: url.deletingPathExtension().appendingPathExtension("json"), atomically: true, encoding: .utf8)
                 try? fm.removeItem(at: url)
             } else if Date().timeIntervalSince(mtime) > 5 {
@@ -645,9 +646,23 @@ final class Session {
         if n > fsSpaces { pendingUntil = now + 1.5 }
         if n < fsSpaces { pendingUntil = 0 }
         fsSpaces = n
-        if let why = Display.fullScreenReason(screen) { pendingUntil = 0; show(why: why) }
+        if let why = Display.fullScreenReason(screen) ?? (Session.pluginFullScreen(on: screen) ? "IINA plugin: full screen" : nil) {
+            pendingUntil = 0; show(why: why)
+        }
         else if now < pendingUntil { show(why: "full-screen transition") }
         else { hide() }
+    }
+
+    // The IINA plugin reports full screen as its transition starts, before a Space appears (and legacy
+    // full screen never makes one).
+    static func pluginFullScreen(on screen: NSScreen) -> Bool {
+        let url = Config.iinaData.appendingPathComponent("status.json")
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let mtime = attrs[.modificationDate] as? Date, Date().timeIntervalSince(mtime) < 3,
+              let data = try? Data(contentsOf: url),
+              let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              o["fullscreen"] as? Bool == true, let f = o["screen"] as? [String: Double] else { return false }
+        return abs((f["x"] ?? -1) - screen.frame.minX) < 1 && abs((f["y"] ?? -1) - screen.frame.minY) < 1
     }
 
     // IINA with a live plugin fills its own letterbox inside mpv; only the notch band is ours then.
@@ -781,7 +796,7 @@ final class Controller: NSObject {
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
         Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.refresh() }
         Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.tick() }
-        Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.slowTick() }
+        Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in self?.slowTick() }
         rebuild()
     }
 
