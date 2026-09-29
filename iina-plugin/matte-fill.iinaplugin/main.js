@@ -1,7 +1,9 @@
 // Fills the area around the picture inside mpv itself. `background` takes the agent's color on the
-// displays Matte targets; bars baked into the video are pushed out of view in full screen with
-// VO geometry (margins + zoom + pan), which never touches the filter chain or the hardware decoder.
-// Bars are measured from async screenshots that the matte-fill agent analyzes.
+// displays Matte targets; bars baked into the video are pushed out of view with VO geometry
+// (margins + zoom + pan), which never touches the filter chain or the hardware decoder. IINA keeps
+// mpv's keepaspect off while windowed, which disables all of that geometry, and turns it on
+// synchronously as full screen starts; so the geometry is set in advance and lands on the first
+// full-screen frame. Bars are measured from async screenshots that the matte-fill agent analyzes.
 const { core, event, mpv, file, utils } = iina;
 
 const STATE = "~/Library/Caches/matte-fill/state.json";
@@ -36,7 +38,8 @@ function targetScreen(st) {
                                 Math.abs(s.w - a.width) < 1 && Math.abs(s.h - a.height) < 1) || null;
 }
 
-// MARK: bar detection (per file, from screenshots at playback positions 1/4/10/20 s, then every 30 s)
+// MARK: bar detection (per file: screenshots after 0.5/2/4/8/15 s of actual playback, so a resumed
+// film is measured right away, plus one per 30 s of playback position)
 
 let media = null;
 function hash(s) {
@@ -45,27 +48,33 @@ function hash(s) {
   return h.toString(36);
 }
 
-function binOf(pos) {
-  if (!(pos >= 1)) return -1;
-  const early = [1, 4, 10, 20];
-  return pos < 30 ? early.filter((x) => pos >= x).length - 1 : 3 + Math.floor(pos / 30);
-}
+const EARLY_MS = [500, 2000, 4000, 8000, 15000];
 
 function shotTick() {
   const url = core.status.url;
   if (!url) { media = null; return; }
-  if (!media || media.url !== url) media = { url, key: hash(url), bins: {}, pending: {}, results: [], bars: null, color: null };
+  const now = Date.now();
+  if (!media || media.url !== url) {
+    media = { url, key: hash(url), n: 0, played: 0, early: 0, bins: {}, pending: {}, results: [], bars: null, color: null, at: now };
+  }
+  const dt = now - media.at;
+  media.at = now;
   collect();
   const vp = mpv.getNative("video-out-params");
-  if (!vp || !vp.dw || core.status.paused || Object.keys(media.bins).length >= MAX_SHOTS) return;
-  const bin = binOf(mpv.getNumber("time-pos"));
-  if (bin < 0 || media.bins[bin]) return;
-  media.bins[bin] = true;
-  const name = `shot-${media.key}-${bin}`;
+  if (!vp || !vp.dw || core.status.paused || media.n >= MAX_SHOTS) return;
+  media.played += dt;
+  const pos = mpv.getNumber("time-pos");
+  const bin = pos >= 0 ? Math.floor(pos / 30) : -1;
+  let take = false;
+  if (media.early < EARLY_MS.length && media.played >= EARLY_MS[media.early]) { media.early++; take = true; }
+  else if (media.early > 0 && bin >= 0 && !media.bins[bin]) take = true;
+  if (!take) return;
+  if (bin >= 0) media.bins[bin] = true;
+  const name = `shot-${media.key}-${media.n++}`;
   const path = utils.resolvePath(`${DATA}${name}.jpg`);
   if (!path) return;
   mpv.command("no-osd", ["async", "screenshot-to-file", path, "video"]);   // encoded on an mpv worker thread
-  media.pending[name] = Date.now();
+  media.pending[name] = now;
 }
 
 // Picks up the agent's analyses; bars are the per-side minimum over informative frames, so a dark
@@ -102,12 +111,12 @@ function geometry(scr) {
   const vp = mpv.getNative("video-out-params"), od = mpv.getNative("osd-dimensions");
   const bars = media && media.bars;
   if (!bars || !vp || !vp.dw || !vp.dh || !od || !od.w || !od.h || (vp.rotate || 0) % 180) return null;
-  // Final window aspect: native full screen sits below the camera housing; once the size has been
-  // stable for 300 ms the real window (e.g. legacy full screen) is authoritative.
+  // Final window aspect: native full screen sits below the camera housing; once a full-screen window
+  // has kept its size for 300 ms, the real window (e.g. legacy full screen) is authoritative.
   const now = Date.now(), dims = `${od.w}x${od.h}`;
   if (dims !== lastDims) { lastDims = dims; dimsSince = now; }
   const cur = od.w / od.h;
-  const fin = now - dimsSince >= 300 ? cur : scr.w / (scr.h - (scr.top || 0));
+  const fin = fsNow && now - dimsSince >= 300 ? cur : scr.w / (scr.h - (scr.top || 0));
   const { t, b, l, r } = bars;
   const fx = 1 - l - r, fy = 1 - t - b, ca = (vp.dw / vp.dh) * fx / fy;
   // Clipping top/bottom bars needs area aspect >= content aspect, side bars the reverse; the window
@@ -141,7 +150,7 @@ function update() {
   // first full-screen frame already matches.
   const bg = !scr ? orig.background : (scr.active || !media || !media.color ? scr.color : media.color);
   if (bg && bg !== appliedBg) { mpv.set("background", bg); appliedBg = bg; }
-  const g = scr && fsNow ? geometry(scr) : null;
+  const g = scr ? geometry(scr) : null;   // inert until IINA enables keepaspect for full screen
   setGeometry(g);
 
   const now = Date.now();
@@ -149,7 +158,7 @@ function update() {
     lastReport = now;
     file.write(`${DATA}status.json`, JSON.stringify({
       t: now, targeted: !!scr, fullscreen: fsNow, background: appliedBg, geometry: g, error: lastError,
-      bars: media && media.bars, shots: media ? Object.keys(media.bins).length : 0,
+      bars: media && media.bars, shots: media ? media.n : 0,
       analyzed: media ? media.results.length : 0,
     }));
   }
