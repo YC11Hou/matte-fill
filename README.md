@@ -65,7 +65,7 @@ Apps with no source hook get a colored overlay over the detected letterbox. Only
 ```json
 { "displays": "builtin", "instantSpaceSwitch": false, "fallbackColor": "#3A3733", "adaptive": true,
   "coverBars": true, "minLightness": 0.34, "maxLightness": 0.56, "maxChroma": 0.05,
-  "smoothingSeconds": 1.2, "fadeSeconds": 0.35, "sampleFPS": 10 }
+  "smoothingSeconds": 1.2, "fadeSeconds": 0.6, "sampleFPS": 10 }
 ```
 
 `displays` is `builtin` (the MacBook's own display only) or `all` (every display). It can also be set with `matte-fill --displays builtin|all`.

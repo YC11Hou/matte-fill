@@ -15,7 +15,7 @@ struct Config: Codable {
     var maxLightness = 0.56
     var maxChroma = 0.05               // keeps the tint muted
     var smoothingSeconds = 1.2
-    var fadeSeconds = 0.35             // fade-in of the large color area (0 = instant, more = smoother)
+    var fadeSeconds = 0.6              // fade-in of the large color area (0 = instant, more = smoother)
     var sampleFPS = 10.0
     var displays = "builtin"           // "builtin": only the MacBook's own display; "all": every display
     var instantSpaceSwitch = false     // make full-screen Space switching instant (removes the slide seam/delay)
