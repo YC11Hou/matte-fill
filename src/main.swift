@@ -658,7 +658,7 @@ final class Session {
     }
 
     // Drive show/hide from full-screen state. The notch band panel joins full-screen spaces on its own
-    // (canJoinAllSpaces), so we never add or remove our windows from spaces by hand — a stuck full-screen
+    // (canJoinAllSpaces), so we never add or remove our windows from spaces by hand -- a stuck full-screen
     // window used to cover the desktop wallpaper. We only ever order the band in (full screen) or out.
     func refresh() {
         let now = CACurrentMediaTime()

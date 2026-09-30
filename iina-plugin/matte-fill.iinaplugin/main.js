@@ -170,7 +170,7 @@ function update() {
   if (fsNow && !fsPrev) fsEdge = now;   // full-screen rising edge
   fsPrev = fsNow;
   // The letterbox is black during the zoom (mpv frozen, the window hasn't covered the bars yet). Only
-  // after the zoom (~ZOOM_MS) is mpv rendering the bars again — start the dark->light fade there so it
+  // after the zoom (~ZOOM_MS) is mpv rendering the bars again -- start the dark->light fade there so it
   // is actually seen, over `fade` seconds, instead of a pop.
   const target = !scr ? orig.background : (scr.active || !media || !media.color ? scr.color : media.color);
   let bg = target;
