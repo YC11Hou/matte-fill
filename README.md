@@ -54,10 +54,6 @@ Per display: the display's current Space is a native full‑screen Space (`CGSCo
 3. Only frames whose picture spans one axis edge to edge count; a logo or a lone lit object on black is ignored. Each side takes the minimum over informative frames, so a dark scene can only shrink the bars. Symmetric bars apply after one informative frame; an asymmetric result needs three.
 4. In full screen, margins frame the content, zoom fills it, pan centers it. IINA keeps mpv's `keepaspect` off while windowed (which disables this geometry) and turns it on synchronously as full screen starts, so the geometry is prepared while windowed and lands on the first full‑screen frame. The formula is validated offline against mpv 0.35's `video/out/aspect.c`.
 
-### The full‑screen Space backdrop
-
-A full‑screen Space is black wherever no app window reaches. The moment a Space is created, Matte's colored plate and the notch band become members of it (via `SLSAddWindowsToSpaces`), one level below normal windows, so the compositor draws the Space with Matte's color from its first frame, the slide‑in included. The plate never joins a desktop Space, so it can't tint the desktop or its widgets, and it's removed when the last full‑screen Space goes.
-
 ### Other apps — overlay (fallback)
 
 Apps with no source hook get a colored overlay over the detected letterbox. Only that app's own window is sampled, so system HUDs don't trigger a cutout. On entry, without cached geometry, the whole screen is colored at once and the video region is carved out on the first sampled frame, turning a black‑then‑color jump into a color‑to‑video reveal.

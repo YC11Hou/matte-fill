@@ -134,8 +134,6 @@ enum Palette {
 
 @_silgen_name("CGSMainConnectionID") func CGSMainConnectionID() -> Int32
 @_silgen_name("CGSCopyManagedDisplaySpaces") func CGSCopyManagedDisplaySpaces(_ cid: Int32) -> CFArray?
-@_silgen_name("SLSAddWindowsToSpaces") func SLSAddWindowsToSpaces(_ cid: Int32, _ windows: CFArray, _ spaces: CFArray)
-@_silgen_name("SLSRemoveWindowsFromSpaces") func SLSRemoveWindowsFromSpaces(_ cid: Int32, _ windows: CFArray, _ spaces: CFArray)
 
 enum Display {
     static func targetScreens(_ cfg: Config) -> [NSScreen] {
@@ -176,11 +174,6 @@ enum Display {
             return Set((d["Spaces"] as? [[String: Any]] ?? []).filter { ($0["type"] as? Int) == 4 }.compactMap(spaceID))
         }
         return []
-    }
-
-    static func allSpaceIDs() -> Set<UInt64> {
-        let spaces = CGSCopyManagedDisplaySpaces(CGSMainConnectionID()) as? [[String: Any]] ?? []
-        return Set(spaces.flatMap { ($0["Spaces"] as? [[String: Any]] ?? []).compactMap(spaceID) })
     }
 
     static func fullScreenReason(_ screen: NSScreen) -> String? {
@@ -635,9 +628,6 @@ final class Session {
     let displayID: CGDirectDisplayID
     var panel: OverlayPanel?
     var view: OverlayView?
-    var plate: OverlayPanel?
-    var plateSpaces = Set<UInt64>()
-    var knownFS = Set<UInt64>()
     var sampler: Sampler?
     var shown = false
     var current: OKLab
@@ -665,19 +655,14 @@ final class Session {
         hide()
         sampler?.stop(); sampler = nil
         panel?.orderOut(nil); panel = nil; view = nil
-        plate?.orderOut(nil); plate = nil
     }
 
-    // A new full-screen Space appears as the zoom animation starts; show the band right then.
+    // Drive show/hide from full-screen state. The notch band panel joins full-screen spaces on its own
+    // (canJoinAllSpaces), so we never add or remove our windows from spaces by hand — a stuck full-screen
+    // window used to cover the desktop wallpaper. We only ever order the band in (full screen) or out.
     func refresh() {
         let now = CACurrentMediaTime()
-        let ids = Display.fullScreenSpaceIDs(screen)
-        let fresh = ids.subtracting(knownFS)
-        knownFS = ids
-        plateSpaces.formIntersection(ids)
-        if !fresh.isEmpty { adopt(fresh) }
-        if plateSpaces.isEmpty, plate?.isVisible == true { plate?.orderOut(nil) }
-        let n = ids.count
+        let n = Display.fullScreenSpaceIDs(screen).count
         if n > fsSpaces { pendingUntil = now + 1.5 }
         if n < fsSpaces { pendingUntil = 0 }
         fsSpaces = n
@@ -686,29 +671,6 @@ final class Session {
         }
         else if now < pendingUntil { show(why: "full-screen transition") }
         else { hide() }
-    }
-
-    // A full-screen Space is empty (black) wherever its app window doesn't reach. Our plate and band
-    // become members of the Space the moment it exists, so the compositor draws them as part of it
-    // from its first frame, including the slide-in; the plate never belongs to a desktop Space.
-    private func adopt(_ ids: Set<UInt64>) {
-        guard let plate, let panel else { return }
-        let cid = CGSMainConnectionID(), spaces = Array(ids) as CFArray
-        plate.backgroundColor = NSColor(cgColor: ColorMath.cgColor(current)) ?? .black
-        SLSAddWindowsToSpaces(cid, [plate.windowNumber] as CFArray, spaces)
-        SLSAddWindowsToSpaces(cid, [panel.windowNumber] as CFArray, spaces)
-        plateSpaces.formUnion(ids)
-        if !plate.isVisible {
-            plate.alphaValue = 0
-            plate.orderFrontRegardless()
-            let others = Display.allSpaceIDs().subtracting(plateSpaces)
-            SLSRemoveWindowsFromSpaces(cid, [plate.windowNumber] as CFArray, Array(others) as CFArray)
-            // Ease the backdrop from the system's black to our color instead of popping.
-            if cfg.fadeSeconds > 0.01 {
-                NSAnimationContext.runAnimationGroup { ctx in ctx.duration = cfg.fadeSeconds; plate.animator().alphaValue = 1 }
-            } else { plate.alphaValue = 1 }
-        }
-        show(why: "full-screen Space \(ids.sorted())")
     }
 
     // The IINA plugin reports full screen as its transition starts, before a Space appears (and legacy
@@ -754,16 +716,6 @@ final class Session {
         v.setRects([])
         p.alphaValue = 0
         panel = p; view = v
-        let pl = OverlayPanel(contentRect: f, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        pl.level = NSWindow.Level(rawValue: NSWindow.Level.normal.rawValue - 1)   // under the app and its popups
-        pl.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle]
-        pl.ignoresMouseEvents = true
-        pl.hasShadow = false
-        pl.hidesOnDeactivate = false
-        pl.isReleasedWhenClosed = false
-        pl.animationBehavior = .none
-        pl.setFrame(f, display: false)
-        plate = pl
         if cfg.adaptive || cfg.coverBars {
             let s = Sampler(cfg: cfg, bandFraction: Double(screen.safeAreaInsets.top / f.height), screenSize: f.size)
             s.onAnalysis = { [weak self] a in
@@ -842,7 +794,6 @@ final class Session {
                         a: current.a + (target.a - current.a) * k,
                         b: current.b + (target.b - current.b) * k)
         view?.setColor(current)
-        if plate?.isVisible == true { plate?.backgroundColor = NSColor(cgColor: ColorMath.cgColor(current)) ?? .black }
         let (r, g, b) = ColorMath.toSRGB(current)
         sampler?.tintBytes = (Int(r * 255 + 0.5), Int(g * 255 + 0.5), Int(b * 255 + 0.5))
         if let f = panel?.frame {
