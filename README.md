@@ -4,9 +4,11 @@
 
 ## The effect
 
-The bar color is sampled from the picture, so it follows each scene:
+The bar color is sampled from the picture, so it adapts to every scene -- green fields, warm fur, cool mist:
 
-![Without Matte vs with Matte, across four scenes](docs/comparison.png)
+![Without Matte (black bars) versus with Matte (bars colored to match), across six film scenes](docs/comparison.jpg)
+
+<sub>Frames from the open movies Big Buck Bunny and Sintel, (c) Blender Foundation, licensed CC BY 3.0.</sub>
 
 ## Install
 
