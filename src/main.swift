@@ -218,40 +218,83 @@ final class OverlayPanel: NSPanel {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 }
 
+// The bars are not cut around player UI: a live copy of the screen is screen-blended over the fill
+// (out = src + (1 - src) * fill), so pure black becomes exactly the fill, while titles, controls and
+// their anti-aliased edges stay intact. The black base is replaced per pixel, not covered selectively.
 final class OverlayView: NSView {
-    private let shape = CAShapeLayer()
+    private let bars = CALayer()
     private let band = CALayer()
+    private var tiles: [(fill: CALayer, mirror: CALayer)] = []
+    private var color: CGColor?
+    private var surface: IOSurface?
+    private var held: [CVPixelBuffer] = []
+    var mirrorEnabled = false { didSet { showMirror() } }
     override var isFlipped: Bool { true }
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
+        layerUsesCoreImageFilters = true
         layer = CALayer()
-        layer!.addSublayer(shape)
-        shape.frame = bounds
-        shape.actions = ["path": NSNull(), "fillColor": NSNull()]
+        bars.frame = bounds
+        layer!.addSublayer(bars)
         band.actions = ["backgroundColor": NSNull(), "frame": NSNull()]
         layer!.addSublayer(band)
     }
     required init?(coder: NSCoder) { fatalError() }
 
+    // One clipped tile per bar: the fill, with the full-screen mirror positioned so it lines up with
+    // the screen, screen-blended on top.
     func setRects(_ rects: [CGRect]) {
-        let p = CGMutablePath()
-        p.addRects(rects)
-        shape.path = p
-
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        bars.sublayers = nil
+        tiles = rects.map { r in
+            let tile = CALayer(), fill = CALayer(), mirror = CALayer()
+            tile.frame = r
+            tile.masksToBounds = true
+            fill.frame = tile.bounds
+            fill.backgroundColor = color
+            mirror.frame = CGRect(x: -r.minX, y: -r.minY, width: bounds.width, height: bounds.height)
+            mirror.contentsGravity = .resize
+            mirror.compositingFilter = CIFilter(name: "CIScreenBlendMode")
+            mirror.contents = surface
+            tile.addSublayer(fill); tile.addSublayer(mirror)
+            bars.addSublayer(tile)
+            return (fill, mirror)
+        }
+        CATransaction.commit()
     }
 
-    func setColor(_ c: OKLab) { shape.fillColor = ColorMath.cgColor(c); band.backgroundColor = shape.fillColor }
+    // Keeps the latest captured frame even while hidden (a static screen sends no new frames), and
+    // retains the last few buffers so capture never reuses a surface that is still on screen.
+    func setMirror(_ px: CVPixelBuffer?) {
+        if let px { held.append(px); if held.count > 3 { held.removeFirst() } } else { held = [] }
+        showMirror()
+    }
+
+    private func showMirror() {
+        surface = mirrorEnabled ? held.last.flatMap { CVPixelBufferGetIOSurface($0)?.takeUnretainedValue() } : nil
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        for t in tiles { t.mirror.contents = surface }
+        CATransaction.commit()
+    }
+
+    func setColor(_ c: OKLab) {
+        color = ColorMath.cgColor(c)
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        for t in tiles { t.fill.backgroundColor = color }
+        band.backgroundColor = color
+        CATransaction.commit()
+    }
 
     // Fade the letterbox color in (not the notch band), so the large area eases from the system's
     // black to our color instead of popping once the full-screen zoom finishes.
     func fadeInLetterbox(_ seconds: Double) {
-        shape.removeAnimation(forKey: "fade")
+        bars.removeAnimation(forKey: "fade")
         let a = CABasicAnimation(keyPath: "opacity")
         a.fromValue = 0; a.toValue = 1; a.duration = seconds
         a.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        shape.opacity = 1
-        shape.add(a, forKey: "fade")
+        bars.opacity = 1
+        bars.add(a, forKey: "fade")
     }
 
     func setBand(_ r: CGRect) { band.frame = r }
@@ -268,13 +311,15 @@ final class OverlayView: NSView {
 
 struct Analysis {
     var color: OKLab?
-    var rects: [CGRect]   // bar areas in screen points, top-left origin, subtitle holes already cut out
+    var rects: [CGRect]   // bar areas in screen points, top-left origin
 }
 
 final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
     var onAnalysis: ((Analysis) -> Void)?
     var onLost: (() -> Void)?
+    var onMirror: ((CVPixelBuffer) -> Void)?
     private let queue = DispatchQueue(label: "matte-fill.sample")
+    private let mirrorQueue = DispatchQueue(label: "matte-fill.mirror")
     private let cfg: Config
     private let bandFraction: Double
     private let screenSize: CGSize
@@ -282,7 +327,7 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
     // Bar state, only touched on `queue`.
     private var est = [0, 0, 0, 0]            // top, bottom, left, right (sample px)
     private var cand = [(0, 0.0), (0, 0.0)]   // (extent, since) for vertical and horizontal pairs
-    private var lastSeen: [Double] = []
+    private var size = (0, 0)
     private var frameNo = 0
     var tintBytes = (-100, -100, -100)
     var barsEnabled = true
@@ -298,6 +343,8 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private var prepared: SCStream?
     private var running = false
+    private var mirrorStream: SCStream?
+    private var mirrorRunning = false
 
     // Build the stream ahead of time so entering full screen only has to call startCapture.
     func prepare(displayID: CGDirectDisplayID, excludeWindowID: CGWindowID) {
@@ -320,11 +367,25 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
             conf.showsCursor = false
             conf.queueDepth = 3
             let s = SCStream(filter: filter, configuration: conf, delegate: self)
+            // Second stream at native pixels and frame rate, only GPU-composited (never read on the CPU).
+            let mc = SCStreamConfiguration()
+            let mode = CGDisplayCopyDisplayMode(displayID)
+            mc.width = mode?.pixelWidth ?? display.width * 2
+            mc.height = mode?.pixelHeight ?? display.height * 2
+            mc.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+            mc.pixelFormat = kCVPixelFormatType_32BGRA
+            mc.colorSpaceName = CGColorSpace.sRGB
+            mc.showsCursor = false
+            mc.queueDepth = 6
+            let m = SCStream(filter: filter, configuration: mc, delegate: self)
             do {
                 try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.queue)
+                try m.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.mirrorQueue)
                 DispatchQueue.main.async {
                     self.prepared = s
+                    self.mirrorStream = m
                     if self.running { s.startCapture { e in if let e { NSLog("matte-fill: startCapture failed: \(e)") } } }
+                    if self.mirrorRunning { self.mirrorRunning = false; self.setMirror(true) }
                 }
             } catch { NSLog("matte-fill: addStreamOutput failed: \(error)") }
         }
@@ -336,7 +397,9 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
             guard let self, let content, let display = self.display,
                   let app = content.applications.first(where: { $0.processID == pid }) else { return }
             let f = SCContentFilter(display: display, including: [app], exceptingWindows: [])
-            DispatchQueue.main.async { self.prepared?.updateContentFilter(f) { e in if let e { NSLog("matte-fill: focus failed: \(e)") } } }
+            DispatchQueue.main.async {
+                for st in [self.prepared, self.mirrorStream] { st?.updateContentFilter(f) { e in if let e { NSLog("matte-fill: focus failed: \(e)") } } }
+            }
         }
     }
 
@@ -346,15 +409,29 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
         prepared?.startCapture { e in if let e { NSLog("matte-fill: startCapture failed: \(e)") } }
     }
 
+    // The mirror runs only while bars are painted, so plain full-screen apps cost nothing extra.
+    func setMirror(_ on: Bool) {
+        guard on != mirrorRunning else { return }
+        mirrorRunning = on
+        NSLog("matte-fill: mirror \(on ? "on" : "off")")
+        guard let m = mirrorStream else { return }
+        if on { m.startCapture { e in if let e { NSLog("matte-fill: mirror start failed: \(e)") } } }
+        else { m.stopCapture { _ in } }
+    }
+
     func stop() {
         if running { prepared?.stopCapture { _ in } }
         running = false
+        setMirror(false)
         queue.async { self.est = [0, 0, 0, 0]; self.cand = [(0, 0), (0, 0)]; self.frameNo = 0; self.startedAt = 0 }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         NSLog("matte-fill: stream stopped: \(error)")
-        DispatchQueue.main.async { self.running = false; self.prepared = nil; self.onLost?() }
+        DispatchQueue.main.async {
+            if self.mirrorRunning { self.mirrorStream?.stopCapture { _ in } }
+            self.running = false; self.mirrorRunning = false; self.prepared = nil; self.mirrorStream = nil; self.onLost?()
+        }
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -362,6 +439,7 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let raw = attachments.first?[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
               let px = CMSampleBufferGetImageBuffer(sb) else { return }
+        if stream === mirrorStream { DispatchQueue.main.async { self.onMirror?(px) }; return }
         if startedAt == 0 { startedAt = CACurrentMediaTime() }
         let a = analyze(px, now: CACurrentMediaTime())
         frameNo += 1
@@ -403,14 +481,14 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
         let color = cfg.adaptive
             ? Palette.color(p, stride: stride, x: l..<(w - r), y: (y0 + t)..<(h - b), step: 4, cfg: cfg, skip: dark) : nil
 
-        return Analysis(color: color, rects: barRects(w: w, h: h, y0: y0, now: now))
+        return Analysis(color: color, rects: barRects(w: w, h: h, y0: y0))
     }
 
     // Bars are adopted only when strictly black, symmetric and stable for 1.5 s; once adopted they
     // persist while their rows stay mostly black (so subtitles inside a bar don't drop it) and
     // shrink immediately when real content reaches into them.
     private func updateBars(w: Int, h: Int, y0: Int, now: Double, dark: (Int, Int) -> Bool) {
-        if lastSeen.count != w * h { lastSeen = [Double](repeating: 0, count: w * h); est = [0, 0, 0, 0] }
+        if size != (w, h) { size = (w, h); est = [0, 0, 0, 0] }
         let ch = h - y0
         var rowFrac = [Double](repeating: 0, count: h)
         for y in y0..<h {
@@ -476,73 +554,24 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
             if c > 0, now - cand[pair].1 >= (now - startedAt < 2 ? 0 : 0.25),
                abs(d0 - est[e0]) > 1 || abs(d1 - est[e1]) > 1 {
                 est[e0] = d0; est[e1] = d1
-                for i in lastSeen.indices { lastSeen[i] = 0 }   // forget transition-era holes
             }
         }
-        // Remember where non-black pixels (subtitles, controls) appear inside the bars.
-        let (t, b, l, r) = (est[0], est[1], est[2], est[3])
-        func mark(_ xs: Range<Int>, _ ys: Range<Int>) {
-            guard !xs.isEmpty, !ys.isEmpty else { return }
-            for y in ys { for x in xs where !dark(x, y) {
-                for yy in max(0, y - 4)...min(h - 1, y + 4) { for xx in max(0, x - 4)...min(w - 1, x + 4) {
-                    lastSeen[yy * w + xx] = now
-                } }
-            } }
-        }
-        mark(0..<w, y0..<(y0 + t))
-        mark(0..<w, (h - b)..<h)
-        mark(0..<l, (y0 + t)..<(h - b))
-        mark((w - r)..<w, (y0 + t)..<(h - b))
     }
 
-    // Row-major runs of covered cells, merged across identical consecutive rows, in screen points.
-    // Each bar reaches 1 px into the content to hide the anti-aliased boundary row.
-    private func barRects(w: Int, h: Int, y0: Int, now: Double) -> [CGRect] {
+    // Whole bar regions in screen points. Each bar reaches 2 px into the content: the scaled video's
+    // soft edge fades to black there, and the screen-blended mirror turns that fade into the fill.
+    private func barRects(w: Int, h: Int, y0: Int) -> [CGRect] {
         let (t, b, l, r) = (est[0], est[1], est[2], est[3])
-        guard t + b + l + r > 0, lastSeen.count == w * h else { return [] }
+        let e = 2
         let sx = screenSize.width / Double(w), sy = screenSize.height / Double(h)
-        var out: [CGRect] = []
-        func region(_ xs: Range<Int>, _ ys: Range<Int>) {
-            guard !xs.isEmpty, !ys.isEmpty else { return }
-            // Group recent non-black cells into horizontal clusters and cut one clean box per cluster.
-            var boxes: [(Range<Int>, Range<Int>)] = []
-            var colHit = [Bool](repeating: false, count: xs.count)
-            for y in ys where y < h { for x in xs where now - lastSeen[y * w + x] <= 0.4 { colHit[x - xs.lowerBound] = true } }
-            var i = 0
-            while i < colHit.count {
-                guard colHit[i] else { i += 1; continue }
-                var j = i, gap = 0
-                while j + 1 < colHit.count, gap < 24 { j += 1; gap = colHit[j] ? 0 : gap + 1 }
-                let cx = (xs.lowerBound + i)..<(xs.lowerBound + j - gap + 1)
-                var y0b = Int.max, y1b = Int.min
-                for y in ys where y < h { for x in cx where now - lastSeen[y * w + x] <= 0.4 { y0b = min(y0b, y); y1b = max(y1b, y) } }
-                if y0b <= y1b { boxes.append((max(xs.lowerBound, cx.lowerBound - 4)..<min(xs.upperBound, cx.upperBound + 4),
-                                              max(ys.lowerBound, y0b - 2)..<min(ys.upperBound, y1b + 3))) }
-                i = j + 1
-            }
-            var prevRuns: [Range<Int>] = [], startY = ys.lowerBound
-            func flush(_ endY: Int) {
-                for run in prevRuns {
-                    out.append(CGRect(x: Double(run.lowerBound) * sx, y: Double(startY) * sy,
-                                      width: Double(run.count) * sx, height: Double(endY - startY) * sy))
-                }
-            }
-            for y in ys {
-                var runs: [Range<Int>] = [], s = -1
-                for x in xs {
-                    let covered = !boxes.contains { $0.0.contains(x) && $0.1.contains(y) }
-                    if covered, s < 0 { s = x }
-                    if !covered, s >= 0 { runs.append(s..<x); s = -1 }
-                }
-                if s >= 0 { runs.append(s..<xs.upperBound) }
-                if runs != prevRuns { flush(y); prevRuns = runs; startY = y }
-            }
-            flush(ys.upperBound)
+        func rect(_ xs: Range<Int>, _ ys: Range<Int>) -> CGRect {
+            CGRect(x: Double(xs.lowerBound) * sx, y: Double(ys.lowerBound) * sy, width: Double(xs.count) * sx, height: Double(ys.count) * sy)
         }
-        if t > 0 { region(0..<w, y0..<min(h, y0 + t + 1)) }
-        if b > 0 { region(0..<w, max(y0, h - b - 1)..<h) }
-        if l > 0 { region(0..<min(w, l + 1), (y0 + t)..<(h - b)) }
-        if r > 0 { region(max(0, w - r - 1)..<w, (y0 + t)..<(h - b)) }
+        var out: [CGRect] = []
+        if t > 0 { out.append(rect(0..<w, y0..<min(h, y0 + t + e))) }
+        if b > 0 { out.append(rect(0..<w, max(y0, h - b - e)..<h)) }
+        if l > 0 { out.append(rect(0..<min(w, l + e), (y0 + t)..<(h - b))) }
+        if r > 0 { out.append(rect(max(0, w - r - e)..<w, (y0 + t)..<(h - b))) }
         return out
     }
 }
@@ -728,9 +757,10 @@ final class Session {
                     self.target = c
                     if self.snapNext { self.current = c; self.snapNext = false; self.view?.setColor(c) }   // first sample: no fade
                 }
-                if a.rects != self.barRects { self.barRects = a.rects; self.view?.setRects(a.rects) }
+                if a.rects != self.barRects || self.view?.mirrorEnabled != !a.rects.isEmpty { self.applyBars(a.rects, live: true) }
                 if let k = self.shownKey, self.framesSinceShow > 3 { self.barCache[k] = a.rects }
             }
+            s.onMirror = { [weak self] px in self?.view?.setMirror(px) }
             sampler = s
             let did = displayID, wid = CGWindowID(p.windowNumber)
             s.onLost = { [weak s] in s?.prepare(displayID: did, excludeWindowID: wid) }
@@ -754,21 +784,21 @@ final class Session {
             current = c; target = c; snapNext = false; view?.setColor(c)
         }
         if let k = shownKey, let cached = barCache[k], !native {
-            barRects = cached; view?.setRects(cached)   // same window as before: exact bars, no flash
+            applyBars(cached, live: true)   // same window as before: exact bars, no flash
         } else if !native, CGPreflightScreenCaptureAccess() {
             // No cached geometry: cover the whole screen with our color at once, so the app's black
             // bars never show. The sampler carves the video region out on its first frame (~0.1 s),
             // turning the old black->color jump into a color->video reveal. A safety timer clears the
             // cover if no frame ever arrives, so a stalled capture can never hide the video.
             let full = [CGRect(origin: .zero, size: screen.frame.size)]
-            barRects = full; view?.setRects(full)
+            applyBars(full, live: false)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
                 guard let self, self.shown, self.framesSinceShow == 0 else { return }
-                self.barRects = []; self.view?.setRects([])
+                self.applyBars([], live: false)
             }
         }
         sampler?.barsEnabled = !native
-        if native { barRects = []; view?.setRects([]) }
+        if native { applyBars([], live: false) }
         panel.orderFrontRegardless()
         panel.alphaValue = 1
         if cfg.fadeSeconds > 0.01 { view?.fadeInLetterbox(cfg.fadeSeconds) }
@@ -781,9 +811,18 @@ final class Session {
         shown = false
         NSLog("matte-fill: [\(screen.localizedName)] hide (last color \(ColorMath.hex(current)))")
         sampler?.stop()
-        barRects = []
         panel?.orderOut(nil)
-        view?.setRects([])
+        applyBars([], live: false)
+        view?.setMirror(nil)
+    }
+
+    // `live` is false for the provisional full-screen cover, where a mirror would wash the video out.
+    private func applyBars(_ rects: [CGRect], live: Bool) {
+        barRects = rects
+        view?.setRects(rects)
+        let on = live && !rects.isEmpty
+        view?.mirrorEnabled = on
+        if shown { sampler?.setMirror(!rects.isEmpty) }   // warms up during the provisional cover too
     }
 
     // Exponential smoothing toward the sampled target; the first sample after entering full screen snaps.
@@ -874,7 +913,7 @@ final class Controller: NSObject {
     var cfg = Config.load()
     var sessions: [Session] = []
     var lastTick = CACurrentMediaTime()
-    var lastWritten = ""
+    var lastWritten: String?
     var configStamp = Controller.stamp()
 
     static func stamp() -> String {
@@ -900,7 +939,7 @@ final class Controller: NSObject {
         sessions.forEach { $0.tearDown() }
         sessions = Display.targetScreens(cfg).map { Session(cfg: cfg, screen: $0, color: seed) }
         NSLog("matte-fill: displays=\(cfg.displays) -> \(sessions.map { $0.screen.localizedName })")
-        lastWritten = ""
+        lastWritten = nil
         refresh()
     }
 
