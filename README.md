@@ -12,13 +12,15 @@ The bar color is sampled from the picture, so it adapts to every scene — green
 
 ## 2. See it in motion
 
+![Entering full screen without and with Matte](docs/matte-demo-hook.gif)
+
 https://github.com/user-attachments/assets/59617214-055d-476e-8b18-55719ff98903
 
 Entering full screen, the notch band takes the color at once and the bars ease from black to the matched color; leaving, they ease back to black and slide away with the system's own animation, which Matte never alters. Player UI — titles, controls, subtitles — stays exactly as it is: only the black underneath is replaced. Each clip starts 2 s before entering full screen and ends 2 s after leaving it.
 
 A real-world run on YouTube, with the title and controls coming and going over the bars:
 
-https://github.com/user-attachments/assets/9a404dc9-9f9d-49a5-91f2-28e89baa41c8
+https://github.com/user-attachments/assets/54a03edb-887e-445f-b026-c89aba79eb8a
 
 <sub>Sintel trailer, (c) Blender Foundation, licensed CC BY 3.0. The only black left is about a tenth of a second in the notch band as macOS slides into a new full-screen Space: the system's slide doesn't draw other apps' windows.</sub>
 
