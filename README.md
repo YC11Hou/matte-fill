@@ -12,7 +12,7 @@ The bar color is sampled from the picture, so it adapts to every scene — green
 
 ## 2. See it in motion
 
-[![Entering and leaving full screen, without and with Matte](docs/matte-demo-sintel.gif)](docs/matte-demo-sintel.mp4)
+https://github.com/user-attachments/assets/95f2f7c7-6685-400e-9912-ce2100d67e4f
 
 Entering full screen, the notch band takes the color at once and the bars ease from black to the matched color; leaving, they ease back to black and slide away with the system's own animation, which Matte never alters. Player UI — titles, controls, subtitles — stays exactly as it is: only the black underneath is replaced. Full-quality clips: [the comparison above](docs/matte-demo-sintel.mp4) and [a real-world run on YouTube](docs/matte-demo-youtube.mp4), with the title and controls coming and going over the bars. Each clip starts 2 s before entering full screen and ends 2 s after leaving it.
 
