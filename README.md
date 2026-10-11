@@ -14,7 +14,7 @@ The bar color is sampled from the picture, so it adapts to every scene — green
 
 [![Entering and leaving full screen, without and with Matte](docs/matte-demo-sintel.gif)](docs/matte-demo-sintel.mp4)
 
-Entering full screen, the notch band takes the color at once and the bars ease from black to the matched color; leaving, they ease back to black and slide away with the system's own animation, which Matte never alters. Player UI — titles, controls, subtitles — stays exactly as it is: only the black underneath is replaced. Full-quality clips: [the comparison above](docs/matte-demo-sintel.mp4) and [a real-world run on YouTube](docs/matte-demo-youtube.mp4), with the title and controls coming and going over the bars.
+Entering full screen, the notch band takes the color at once and the bars ease from black to the matched color; leaving, they ease back to black and slide away with the system's own animation, which Matte never alters. Player UI — titles, controls, subtitles — stays exactly as it is: only the black underneath is replaced. Full-quality clips: [the comparison above](docs/matte-demo-sintel.mp4) and [a real-world run on YouTube](docs/matte-demo-youtube.mp4), with the title and controls coming and going over the bars. Each clip starts 2 s before entering full screen and ends 2 s after leaving it.
 
 <sub>Sintel trailer, (c) Blender Foundation, licensed CC BY 3.0. The only black left is about a tenth of a second in the notch band as macOS slides into a new full-screen Space: the system's slide doesn't draw other apps' windows.</sub>
 
