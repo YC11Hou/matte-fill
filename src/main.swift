@@ -15,10 +15,9 @@ struct Config: Codable {
     var maxLightness = 0.56
     var maxChroma = 0.05               // keeps the tint muted
     var smoothingSeconds = 1.2
-    var fadeSeconds = 0.6              // fade-in of the large color area (0 = instant, more = smoother)
+    var fadeSeconds = 2.5              // fade-in of the large color area (0 = instant, more = smoother)
     var sampleFPS = 10.0
     var displays = "builtin"           // "builtin": only the MacBook's own display; "all": every display
-    var instantSpaceSwitch = false     // make full-screen Space switching instant (removes the slide seam/delay)
 
     static let dir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".config/matte-fill")
@@ -51,7 +50,6 @@ extension Config {
         fadeSeconds = try c.decodeIfPresent(Double.self, forKey: .fadeSeconds) ?? fadeSeconds
         sampleFPS = try c.decodeIfPresent(Double.self, forKey: .sampleFPS) ?? sampleFPS
         displays = try c.decodeIfPresent(String.self, forKey: .displays) ?? displays
-        instantSpaceSwitch = try c.decodeIfPresent(Bool.self, forKey: .instantSpaceSwitch) ?? instantSpaceSwitch
     }
 }
 
@@ -134,6 +132,8 @@ enum Palette {
 
 @_silgen_name("CGSMainConnectionID") func CGSMainConnectionID() -> Int32
 @_silgen_name("CGSCopyManagedDisplaySpaces") func CGSCopyManagedDisplaySpaces(_ cid: Int32) -> CFArray?
+@_silgen_name("SLSAddWindowsToSpaces") func SLSAddWindowsToSpaces(_ cid: Int32, _ windows: CFArray, _ spaces: CFArray)
+@_silgen_name("SLSRemoveWindowsFromSpaces") func SLSRemoveWindowsFromSpaces(_ cid: Int32, _ windows: CFArray, _ spaces: CFArray)
 
 enum Display {
     static func targetScreens(_ cfg: Config) -> [NSScreen] {
@@ -159,11 +159,32 @@ enum Display {
         return nil
     }
 
+    // Height of the area the system menu bar paints on this display: the camera housing plus the menu
+    // bar's own 1 pt bottom line (its window is 33 pt where safeAreaInsets.top is 32). Zero without a notch.
+    static func menuBarHeight(_ screen: NSScreen) -> CGFloat {
+        let top = screen.safeAreaInsets.top
+        guard top > 0 else { return 0 }
+        let b = CGDisplayBounds(id(of: screen))
+        let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
+        let heights = list.compactMap { w -> CGFloat? in
+            guard w[kCGWindowOwnerName as String] as? String == "Window Server", w[kCGWindowName as String] as? String == "Menubar",
+                  let bd = w[kCGWindowBounds as String] as? NSDictionary, let r = CGRect(dictionaryRepresentation: bd),
+                  abs(r.minX - b.minX) < 1, abs(r.minY - b.minY) < 1, abs(r.width - b.width) < 1 else { return nil }
+            return r.height
+        }
+        return max(top, heights.filter { $0 < top + 8 }.max() ?? top)
+    }
+
     static func spaceID(_ s: [String: Any]) -> UInt64? {
         (s["id64"] as? NSNumber)?.uint64Value ?? (s["ManagedSpaceID"] as? NSNumber)?.uint64Value
     }
 
     // IDs of the native full-screen Spaces (type 4) on the display.
+    static func allSpaceIDs() -> Set<UInt64> {
+        let spaces = CGSCopyManagedDisplaySpaces(CGSMainConnectionID()) as? [[String: Any]] ?? []
+        return Set(spaces.flatMap { ($0["Spaces"] as? [[String: Any]] ?? []).compactMap(spaceID) })
+    }
+
     static func fullScreenSpaceIDs(_ screen: NSScreen) -> Set<UInt64> {
         let did = id(of: screen)
         let uuid = CGDisplayCreateUUIDFromDisplayID(did).map { CFUUIDCreateString(nil, $0.takeRetainedValue()) as String } ?? ""
@@ -218,16 +239,48 @@ final class OverlayPanel: NSPanel {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 }
 
-// The bars are not cut around player UI: a live copy of the screen is screen-blended over the fill
-// (out = src + (1 - src) * fill), so pure black becomes exactly the fill, while titles, controls and
-// their anti-aliased edges stay intact. The black base is replaced per pixel, not covered selectively.
-final class OverlayView: NSView {
-    private let bars = CALayer()
+// The notch band: one plain fill over exactly the camera-housing area, where the menu bar itself
+// paints black. It never reaches into the app's content.
+final class BandView: NSView {
     private let band = CALayer()
-    private var tiles: [(fill: CALayer, mirror: CALayer)] = []
-    private var color: CGColor?
-    private var surface: IOSurface?
+    override var isFlipped: Bool { true }
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer = CALayer()
+        band.actions = ["backgroundColor": NSNull(), "frame": NSNull()]
+        layer!.addSublayer(band)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func setColor(_ c: CGColor) {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        band.backgroundColor = c
+        CATransaction.commit()
+    }
+
+    func setBand(_ r: CGRect) { band.frame = r }
+
+    // Yields to the menu bar when the pointer reaches the top, at the menu bar's own pace.
+    func setBandVisible(_ v: Bool) {
+        guard (band.opacity > 0.5) != v else { return }
+        CATransaction.begin(); CATransaction.setAnimationDuration(0.18)
+        band.opacity = v ? 1 : 0
+        CATransaction.commit()
+    }
+}
+
+// The bars are not cut around player UI: a live copy of the app is screen-blended over the fill
+// (out = src + (1 - src) * fill), so pure black becomes exactly the fill, while titles, controls and
+// their anti-aliased edges stay intact. One persistent tile per edge, so every change (appearing,
+// leaving, resizing) is an eased transition rather than a jump.
+final class BarsView: NSView {
+    enum Edge: CaseIterable { case top, bottom, left, right }
+    private struct Tile { let clip: CALayer, fill: CALayer, mirror: CALayer; var rect: CGRect? }
+    private var tiles: [Edge: Tile] = [:]
     private var held: [CVPixelBuffer] = []
+    var fadeSeconds = 2.5
+    private var span = 2.5
     var mirrorEnabled = false { didSet { showMirror() } }
     override var isFlipped: Bool { true }
     override init(frame: NSRect) {
@@ -235,33 +288,96 @@ final class OverlayView: NSView {
         wantsLayer = true
         layerUsesCoreImageFilters = true
         layer = CALayer()
-        bars.frame = bounds
-        layer!.addSublayer(bars)
-        band.actions = ["backgroundColor": NSNull(), "frame": NSNull()]
-        layer!.addSublayer(band)
+        for e in Edge.allCases {
+            let clip = CALayer(), fill = CALayer(), mirror = CALayer()
+            // The clip's bounds origin always equals its frame origin, so its sublayers stay in screen
+            // coordinates while the clip itself moves or resizes.
+            clip.masksToBounds = true
+            clip.opacity = 0
+            fill.frame = bounds
+            mirror.frame = bounds
+            mirror.contentsGravity = .resize
+            mirror.filters = [BarsView.blackLevel(), BarsView.clampToRange()]
+            mirror.compositingFilter = CIFilter(name: "CIScreenBlendMode")
+            clip.addSublayer(fill); clip.addSublayer(mirror)
+            layer!.addSublayer(clip)
+            tiles[e] = Tile(clip: clip, fill: fill, mirror: mirror, rect: nil)
+        }
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    // One clipped tile per bar: the fill, with the full-screen mirror positioned so it lines up with
-    // the screen, screen-blended on top.
-    func setRects(_ rects: [CGRect]) {
+    // Compressed video black is rarely 0 (it sits around 10-20), so the mirror's black level is pulled
+    // down before the screen blend; otherwise encoded bars would end up a shade lighter than the band.
+    static let videoBlack: CGFloat = 28.0 / 255
+    static func blackLevel() -> CIFilter {
+        let f = CIFilter(name: "CIColorMatrix")!
+        let g = 1 / (1 - videoBlack)
+        f.setValue(CIVector(x: g, y: 0, z: 0, w: 0), forKey: "inputRVector")
+        f.setValue(CIVector(x: 0, y: g, z: 0, w: 0), forKey: "inputGVector")
+        f.setValue(CIVector(x: 0, y: 0, z: g, w: 0), forKey: "inputBVector")
+        f.setValue(CIVector(x: -videoBlack * g, y: -videoBlack * g, z: -videoBlack * g, w: 0), forKey: "inputBiasVector")
+        return f
+    }
+
+    // The black-level shift leaves values below zero; the window server composites them unclamped,
+    // which made screen-blended bars darker than the fill (measured live, 2026-10-11).
+    static func clampToRange() -> CIFilter {
+        let f = CIFilter(name: "CIColorClamp")!
+        f.setValue(CIVector(x: 0, y: 0, z: 0, w: 0), forKey: "inputMinComponents")
+        f.setValue(CIVector(x: 1, y: 1, z: 1, w: 1), forKey: "inputMaxComponents")
+        return f
+    }
+
+    private func edge(of r: CGRect) -> Edge {
+        if r.width >= bounds.width - 1 { return r.midY < bounds.midY ? .top : .bottom }
+        return r.midX < bounds.midX ? .left : .right
+    }
+
+    // Moves each edge's tile toward its new rect: new bars fade in, gone bars fade out, changed bars
+    // slide, all over `fadeSeconds`. `animated: false` resets at once (used when leaving full screen).
+    func setRects(_ rects: [CGRect], animated: Bool, duration: Double? = nil) {
+        span = duration ?? fadeSeconds
+        var want: [Edge: CGRect] = [:]
+        for r in rects { want[edge(of: r)] = r }
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        bars.sublayers = nil
-        tiles = rects.map { r in
-            let tile = CALayer(), fill = CALayer(), mirror = CALayer()
-            tile.frame = r
-            tile.masksToBounds = true
-            fill.frame = tile.bounds
-            fill.backgroundColor = color
-            mirror.frame = CGRect(x: -r.minX, y: -r.minY, width: bounds.width, height: bounds.height)
-            mirror.contentsGravity = .resize
-            mirror.compositingFilter = CIFilter(name: "CIScreenBlendMode")
-            mirror.contents = surface
-            tile.addSublayer(fill); tile.addSublayer(mirror)
-            bars.addSublayer(tile)
-            return (fill, mirror)
+        for e in Edge.allCases {
+            guard var t = tiles[e] else { continue }
+            let to = want[e]
+            if !animated {
+                t.clip.removeAllAnimations()
+                if let to { place(t.clip, to) }
+                t.clip.opacity = to == nil ? 0 : 1
+            } else if let to, let from = t.rect, t.clip.opacity > 0 {
+                if from != to { ease(t.clip, "position") { ease(t.clip, "bounds") { place(t.clip, to) } } }
+            } else if let to {
+                if t.clip.presentation().map({ $0.opacity <= 0.001 }) ?? true { place(t.clip, to) }
+                else { ease(t.clip, "position") { ease(t.clip, "bounds") { place(t.clip, to) } } }
+                ease(t.clip, "opacity") { t.clip.opacity = 1 }
+            } else if t.rect != nil {
+                ease(t.clip, "opacity") { t.clip.opacity = 0 }
+            }
+            t.rect = to
+            tiles[e] = t
         }
         CATransaction.commit()
+    }
+
+    private func place(_ l: CALayer, _ r: CGRect) {
+        l.frame = r
+        l.bounds = r
+    }
+
+    // Animates `key` from what is on screen now to the value `change` sets, so an interrupted
+    // transition continues smoothly from where it is.
+    private func ease(_ l: CALayer, _ key: String, _ change: () -> Void) {
+        let from = (l.presentation() ?? l).value(forKey: key)
+        change()
+        let a = CABasicAnimation(keyPath: key)
+        a.fromValue = from
+        a.toValue = l.value(forKey: key)
+        a.duration = span
+        a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        l.add(a, forKey: key)
     }
 
     // Keeps the latest captured frame even while hidden (a static screen sends no new frames), and
@@ -272,37 +388,15 @@ final class OverlayView: NSView {
     }
 
     private func showMirror() {
-        surface = mirrorEnabled ? held.last.flatMap { CVPixelBufferGetIOSurface($0)?.takeUnretainedValue() } : nil
+        let surface = mirrorEnabled ? held.last.flatMap { CVPixelBufferGetIOSurface($0)?.takeUnretainedValue() } : nil
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        for t in tiles { t.mirror.contents = surface }
+        for t in tiles.values { t.mirror.contents = surface }
         CATransaction.commit()
     }
 
-    func setColor(_ c: OKLab) {
-        color = ColorMath.cgColor(c)
+    func setColor(_ c: CGColor) {
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        for t in tiles { t.fill.backgroundColor = color }
-        band.backgroundColor = color
-        CATransaction.commit()
-    }
-
-    // Fade the letterbox color in (not the notch band), so the large area eases from the system's
-    // black to our color instead of popping once the full-screen zoom finishes.
-    func fadeInLetterbox(_ seconds: Double) {
-        bars.removeAnimation(forKey: "fade")
-        let a = CABasicAnimation(keyPath: "opacity")
-        a.fromValue = 0; a.toValue = 1; a.duration = seconds
-        a.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        bars.opacity = 1
-        bars.add(a, forKey: "fade")
-    }
-
-    func setBand(_ r: CGRect) { band.frame = r }
-
-    func setBandVisible(_ v: Bool) {
-        guard (band.opacity > 0.5) != v else { return }
-        CATransaction.begin(); CATransaction.setAnimationDuration(0.18)
-        band.opacity = v ? 1 : 0
+        for t in tiles.values { t.fill.backgroundColor = c }
         CATransaction.commit()
     }
 }
@@ -327,13 +421,14 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
     // Bar state, only touched on `queue`.
     private var est = [0, 0, 0, 0]            // top, bottom, left, right (sample px)
     private var cand = [(0, 0.0), (0, 0.0)]   // (extent, since) for vertical and horizontal pairs
+    private var pend = [(-1, 0.0), (-1, 0.0), (-1, 0.0), (-1, 0.0)]   // per edge: (proposed depth, since)
     private var size = (0, 0)
     private var frameNo = 0
     var tintBytes = (-100, -100, -100)
     var barsEnabled = true
     private var display: SCDisplay?
     private var startedAt = 0.0
-    private var dbgStrict: [Int] = [], dbgLoose: [Int] = []
+    private var dbgStrict: [Int] = []
 
     init(cfg: Config, bandFraction: Double, screenSize: CGSize) {
         self.cfg = cfg
@@ -423,7 +518,7 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
         if running { prepared?.stopCapture { _ in } }
         running = false
         setMirror(false)
-        queue.async { self.est = [0, 0, 0, 0]; self.cand = [(0, 0), (0, 0)]; self.frameNo = 0; self.startedAt = 0 }
+        queue.async { self.est = [0, 0, 0, 0]; self.cand = [(0, 0), (0, 0)]; self.pend = [(-1, 0), (-1, 0), (-1, 0), (-1, 0)]; self.frameNo = 0; self.startedAt = 0 }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -444,10 +539,10 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
         let a = analyze(px, now: CACurrentMediaTime())
         frameNo += 1
         if frameNo < 30, FileManager.default.fileExists(atPath: Config.dir.appendingPathComponent("debug").path) {
-            NSLog("matte-fill: f\(frameNo) t=\(String(format: "%.2f", CACurrentMediaTime() - startedAt)) strict=\(dbgStrict) est=\(est) rects=\(a.rects.count)")
+            NSLog("matte-fill: f\(frameNo) t=\(String(format: "%.2f", CACurrentMediaTime() - startedAt)) reading=\(dbgStrict) est=\(est) rects=\(a.rects.count)")
         }
         if frameNo == 25, FileManager.default.fileExists(atPath: Config.dir.appendingPathComponent("debug").path) {
-            NSLog("matte-fill: debug w=\(CVPixelBufferGetWidth(px)) h=\(CVPixelBufferGetHeight(px)) strict=\(dbgStrict) loose=\(dbgLoose) est=\(est) cand=\(cand)")
+            NSLog("matte-fill: debug w=\(CVPixelBufferGetWidth(px)) h=\(CVPixelBufferGetHeight(px)) reading=\(dbgStrict) est=\(est) cand=\(cand)")
             let ci = CIImage(cvPixelBuffer: px)
             if let cg = CIContext().createCGImage(ci, from: ci.extent) {
                 let url = Config.dir.appendingPathComponent("debug-frame.png")
@@ -471,10 +566,14 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
         @inline(__always) func dark(_ x: Int, _ y: Int) -> Bool {
             let o = y * stride + x * 4
             let b = Int(p[o]), g = Int(p[o + 1]), r = Int(p[o + 2])
-            return (b <= 10 && g <= 10 && r <= 10) || (abs(r - tr) <= 6 && abs(g - tg) <= 6 && abs(b - tb) <= 6)
+            return (b <= 36 && g <= 36 && r <= 36) || (abs(r - tr) <= 6 && abs(g - tg) <= 6 && abs(b - tb) <= 6)
+        }
+        @inline(__always) func level(_ x: Int, _ y: Int) -> Int {
+            let o = y * stride + x * 4
+            return max(Int(p[o]), Int(p[o + 1]), Int(p[o + 2]))
         }
 
-        if cfg.coverBars && barsEnabled { updateBars(w: w, h: h, y0: y0, now: now, dark: dark) }
+        if cfg.coverBars && barsEnabled { updateBars(w: w, h: h, y0: y0, now: now, dark: dark, level: level) }
         else { est = [0, 0, 0, 0] }
         let (t, b, l, r) = (est[0], est[1], est[2], est[3])
 
@@ -484,76 +583,124 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
         return Analysis(color: color, rects: barRects(w: w, h: h, y0: y0))
     }
 
-    // Bars are adopted only when strictly black, symmetric and stable for 1.5 s; once adopted they
-    // persist while their rows stay mostly black (so subtitles inside a bar don't drop it) and
-    // shrink immediately when real content reaches into them.
-    private func updateBars(w: Int, h: Int, y0: Int, now: Double, dark: (Int, Int) -> Bool) {
+    private enum Reading { case edge(Int, textured: Bool, share: Double), none, unknown }
+
+    // Bars belong to the video's layout, which changes rarely; player UI (controls, titles, subtitles,
+    // danmaku, hints) comes and goes on top of them. So a bar only moves or goes on positive evidence:
+    //   - an edge: a line's black run from the screen edge ends in a sharp step up into a solid stretch of
+    //     picture (thin lines and text strokes don't qualify), at least 20% of lines agree on the depth,
+    //     and they include one unbroken stretch (text is strokes with gaps, a picture edge is a line);
+    //     the deepest such depth wins, since UI inside a bar always sits shallower than its edge;
+    //   - no bar: at least 70% of lines show picture right at the screen edge.
+    // Moving or removing a bar also needs that picture to be textured across lines: player UI (control
+    // strips, panels, gradients) is flat, picture is not. Adopting a new bar doesn't, as frames often
+    // start with flat sky or walls; the pair rule keeps dark scenes out instead.
+    // Anything else (UI covering the edge, a dark scene) is "unknown" and leaves the bars exactly as they
+    // are. New bars need a pair (both edges, or one edge and the other side black just as deep), so a
+    // dark scene can't fake one; changes apply at once in the first 2 s, later after 1 s of agreement.
+    private func updateBars(w: Int, h: Int, y0: Int, now: Double, dark: (Int, Int) -> Bool, level: (Int, Int) -> Int) {
         if size != (w, h) { size = (w, h); est = [0, 0, 0, 0] }
         let ch = h - y0
-        var rowFrac = [Double](repeating: 0, count: h)
-        for y in y0..<h {
-            var k = 0
-            var x = 0
-            while x < w { if dark(x, y) { k += 1 }; x += 2 }
-            rowFrac[y] = Double(k) / Double((w + 1) / 2)
-        }
-        var colFrac = [Double](repeating: 0, count: w)
-        for x in 0..<w {
-            var k = 0, m = 0
-            var y = y0
-            while y < h { if dark(x, y) { k += 1 }; m += 1; y += 2 }
-            colFrac[x] = Double(k) / Double(max(1, m))
-        }
-        func run(_ f: [Double], _ idx: StrideTo<Int>, _ th: Double) -> Int {
-            var n = 0
-            for i in idx { if f[i] >= th { n += 1 } else { break } }
-            return n
-        }
-        // Extent through mostly-black rows whose innermost row is pure black and at least half of
-        // which are pure black, so a subtitle line inside the bar doesn't break detection.
-        func barRun(_ f: [Double], _ idx: StrideTo<Int>) -> Int {
-            var n = 0, strictN = 0, lastStrict = 0
-            for i in idx {
-                guard f[i] >= 0.6 else { break }
-                n += 1
-                if f[i] >= 0.995 { strictN += 1; lastStrict = n }
-            }
-            return lastStrict > 0 && strictN * 2 >= lastStrict ? lastStrict : 0
-        }
-        let strict = [barRun(rowFrac, Swift.stride(from: y0, to: h, by: 1)),
-                      barRun(rowFrac, Swift.stride(from: h - 1, to: y0 - 1, by: -1)),
-                      barRun(colFrac, Swift.stride(from: 0, to: w, by: 1)),
-                      barRun(colFrac, Swift.stride(from: w - 1, to: -1, by: -1))]
-        let loose = [run(rowFrac, Swift.stride(from: y0, to: h, by: 1), 0.6),
-                     run(rowFrac, Swift.stride(from: h - 1, to: y0 - 1, by: -1), 0.6),
-                     run(colFrac, Swift.stride(from: 0, to: w, by: 1), 0.6),
-                     run(colFrac, Swift.stride(from: w - 1, to: -1, by: -1), 0.6)]
-        dbgStrict = strict; dbgLoose = loose
-        // Fraction of dark pixels in the row/column at depth k (1-based) from each edge.
-        func frac(_ edge: Int, _ k: Int) -> Double {
-            switch edge {
-            case 0: let y = y0 + k - 1; return y < h ? rowFrac[y] : 0
-            case 1: let y = h - k; return y >= y0 ? rowFrac[y] : 0
-            case 2: return k - 1 < w ? colFrac[k - 1] : 0
-            default: return w - k >= 0 ? colFrac[w - k] : 0
+        let caps = [ch * 35 / 100 + 2, ch * 35 / 100 + 2, w * 35 / 100 + 2, w * 35 / 100 + 2]
+        let lens = [ch, ch, w, w]
+        let lines = [Array(Swift.stride(from: 0, to: w, by: 2)), Array(Swift.stride(from: 0, to: w, by: 2)),
+                     Array(Swift.stride(from: y0, to: h, by: 2)), Array(Swift.stride(from: y0, to: h, by: 2))]
+        // Pixel at depth d (0 = outermost) along line i from edge e.
+        func at(_ e: Int, _ i: Int, _ d: Int) -> (Int, Int) {
+            switch e {
+            case 0: return (i, y0 + d)
+            case 1: return (i, h - 1 - d)
+            case 2: return (d, i)
+            default: return (w - 1 - d, i)
             }
         }
-        // A bar edge is where a pure-black row meets non-black content; overlays inside the bar
-        // (title bars, OSD, subtitles) don't matter, only the boundary does.
-        func boundaryAt(_ edge: Int, _ m: Int) -> Int? {
-            (max(1, m - 1)...(m + 1)).first { k in frac(edge, k) >= 0.85 && frac(edge, k) - frac(edge, k + 1) >= 0.25 }
+        var runs = [[Int]](repeating: [], count: 4), votes = [[(d: Int, i: Int)]](repeating: [], count: 4), open = [[Int]](repeating: [], count: 4)
+        for e in 0..<4 {
+            for i in lines[e] {
+                var d = 0
+                while d < caps[e], dark(at(e, i, d).0, at(e, i, d).1) { d += 1 }
+                runs[e].append(d)
+                guard d < caps[e] else { continue }
+                let k = min(8, lens[e] - d)
+                var solid = 0
+                for j in 0..<k where !dark(at(e, i, d + j).0, at(e, i, d + j).1) { solid += 1 }
+                let step = max(level(at(e, i, d).0, at(e, i, d).1), d + 1 < lens[e] ? level(at(e, i, d + 1).0, at(e, i, d + 1).1) : 0)
+                guard step >= 48, solid >= k * 3 / 4 else { continue }
+                if d < max(1, lens[e] / 50) { open[e].append(i) } else { votes[e].append((d, i)) }
+            }
         }
-        for i in 0..<4 where est[i] > 0 && frac(i, est[i]) < 0.6 { est[i] = 0 }
-        for (pair, dim) in [(0, ch), (1, w)] {
+        func support(_ e: Int, _ d: Int) -> Double { Double(runs[e].filter { $0 >= d }.count) / Double(max(1, runs[e].count)) }
+        // Picture is textured across lines; player UI (control strips, gradients, panels) is flat. Only
+        // a textured stretch counts as picture.
+        func textured(_ e: Int, _ ls: [Int], _ d: Int) -> Bool {
+            guard d < lens[e], ls.count >= 4 else { return false }
+            var sum = 0.0, sq = 0.0
+            for i in ls {
+                let p = at(e, i, d)
+                let v = Double(level(p.0, p.1))
+                sum += v; sq += v * v
+            }
+            let n = Double(ls.count), m = sum / n
+            return (sq / n - m * m).squareRoot() >= 6
+        }
+        // A picture edge is one long straight line; text and icons are short strokes with gaps between
+        // them. So the agreeing lines must include an unbroken stretch of at least 10% of all lines.
+        func continuous(_ e: Int, _ ls: [Int]) -> Bool {
+            let base = e < 2 ? 0 : y0
+            let ord = ls.map { ($0 - base) / 2 }.sorted()
+            var best = ord.isEmpty ? 0 : 1, cur = 1
+            for k in 1..<max(1, ord.count) where ord.count > 1 {
+                cur = ord[k] - ord[k - 1] <= 2 ? cur + 1 : 1
+                best = max(best, cur)
+            }
+            return Double(best) >= 0.1 * Double(max(1, runs[e].count))
+        }
+        func read(_ e: Int) -> Reading {
+            let n = Double(max(1, runs[e].count))
+            var hist = [Int](repeating: 0, count: caps[e] + 2)
+            for v in votes[e] { hist[v.d] += 1 }
+            for d in Swift.stride(from: caps[e] - 1, through: max(1, lens[e] / 50), by: -1) {
+                guard Double(hist[d - 1] + hist[d] + hist[d + 1]) >= 0.2 * n else { continue }
+                let k = (d - 1...d + 1).max { hist[$0] < hist[$1] }!
+                let near = votes[e].filter { abs($0.d - k) <= 1 }
+                guard continuous(e, near.map(\.i)) else { continue }
+                return .edge(k, textured: textured(e, near.map(\.i), k + 2), share: Double(near.count) / n)
+            }
+            return Double(open[e].count) >= 0.7 * n && textured(e, open[e], 1) ? .none : .unknown
+        }
+        let r = (0..<4).map(read)
+        dbgStrict = r.map { if case .edge(let k, _, _) = $0 { return k }; if case .none = $0 { return 0 }; return -1 }
+        let settle = now - startedAt < 2 ? 0.0 : 1.0
+        for (pair, _) in [(0, ch), (1, w)] {
             let e0 = pair * 2, e1 = pair * 2 + 1
-            let m = max(strict[e0], strict[e1])
-            var d0 = 0, d1 = 0
-            if m >= dim / 50, m <= dim * 35 / 100, let k0 = boundaryAt(e0, m), let k1 = boundaryAt(e1, m) { d0 = k0; d1 = k1 }
-            let c = d0 + d1
-            if abs(c - cand[pair].0) > 2 { cand[pair] = (c, now) }
-            if c > 0, now - cand[pair].1 >= (now - startedAt < 2 ? 0 : 0.25),
-               abs(d0 - est[e0]) > 1 || abs(d1 - est[e1]) > 1 {
-                est[e0] = d0; est[e1] = d1
+            if est[e0] == 0 && est[e1] == 0 {
+                var d0 = 0, d1 = 0
+                switch (r[e0], r[e1]) {
+                case let (.edge(k0, _, _), .edge(k1, _, _)): d0 = k0; d1 = k1
+                case let (.edge(k, _, _), _) where support(e1, k) >= 0.3: d0 = k; d1 = k
+                case let (_, .edge(k, _, _)) where support(e0, k) >= 0.3: d0 = k; d1 = k
+                // One strong, textured edge while the other side is only covered (player UI right after
+                // entering), not contradicted: assume symmetry; the real depth slides in once UI hides.
+                case let (.edge(k, true, sh), .unknown) where sh >= 0.3: d0 = k; d1 = k
+                case let (.unknown, .edge(k, true, sh)) where sh >= 0.3: d0 = k; d1 = k
+                default: break
+                }
+                let c = d0 + d1
+                if abs(c - cand[pair].0) > 2 { cand[pair] = (c, now) }
+                if c > 0, now - cand[pair].1 >= (now - startedAt < 2 ? 0 : 0.25) { est[e0] = d0; est[e1] = d1 }
+                continue
+            }
+            for e in [e0, e1] {
+                var want: Int?
+                switch r[e] {
+                // Deeper by even one sample is taken (never leave a black line); shallower needs two (no jitter).
+                case .edge(let k, true, _) where k > est[e] || est[e] - k > 1: want = k
+                case .none where est[e] > 0: want = 0
+                default: want = nil
+                }
+                guard let want else { pend[e] = (-1, 0); continue }
+                if pend[e].0 < 0 || abs(pend[e].0 - want) > 1 { pend[e] = (want, now) }
+                if now - pend[e].1 >= settle { est[e] = want; pend[e] = (-1, 0) }
             }
         }
     }
@@ -649,14 +796,112 @@ enum ShotAnalyzer {
     }
 }
 
+// MARK: - Menu bar watcher
+
+// Watches what lies under the notch band (our own windows excluded): while the full-screen menu bar is
+// hidden that strip is the system's plain black; once the menu bar slides in, its background and items
+// show up there. The band yields exactly then, never on a guess from the pointer position.
+final class MenuBarWatcher: NSObject, SCStreamOutput, SCStreamDelegate {
+    var onChange: ((Bool) -> Void)?
+    private(set) var visible = false
+    private var stream: SCStream?
+    private var running = false
+    private var blackFrames = 0
+    private var litFrames = 0
+    private let queue = DispatchQueue(label: "matte-fill.menubar")
+    private let sides: [Range<Double>]   // horizontal fractions of the menu bar area beside the camera housing
+
+    init(screen: NSScreen) {
+        let w = screen.frame.width
+        let l = screen.auxiliaryTopLeftArea.map { $0.maxX / w } ?? 0.5
+        let r = screen.auxiliaryTopRightArea.map { $0.minX / w } ?? 0.5
+        sides = [0.0..<max(0.01, l), min(0.99, r)..<1.0]
+    }
+
+    func prepare(displayID: CGDirectDisplayID, height: CGFloat) {
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { [weak self] content, _ in
+            guard let self, let content, let display = content.displays.first(where: { $0.displayID == displayID }) else { return }
+            let pid = ProcessInfo.processInfo.processIdentifier
+            let mine = content.windows.filter { $0.owningApplication?.processID == pid }
+            let conf = SCStreamConfiguration()
+            conf.sourceRect = CGRect(x: 0, y: 0, width: CGFloat(display.width), height: height)
+            conf.width = display.width / 4
+            conf.height = max(4, Int(height / 4))
+            conf.minimumFrameInterval = CMTime(value: 1, timescale: 20)
+            conf.pixelFormat = kCVPixelFormatType_32BGRA
+            conf.showsCursor = false
+            conf.queueDepth = 3
+            let s = SCStream(filter: SCContentFilter(display: display, excludingWindows: mine), configuration: conf, delegate: self)
+            do { try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.queue) } catch { return }
+            DispatchQueue.main.async {
+                self.stream = s
+                if self.running { s.startCapture { _ in } }
+            }
+        }
+    }
+
+    // Forget what was seen so far (it may have been the desktop's menu bar during a Space switch);
+    // showing then needs two lit frames in a row.
+    func reset() {
+        queue.async { self.blackFrames = 0; self.litFrames = 0 }
+        if visible { visible = false; onChange?(false) }
+    }
+
+    func start() {
+        guard !running else { return }
+        running = true; blackFrames = 0
+        stream?.startCapture { _ in }
+    }
+
+    func stop() {
+        guard running else { return }
+        running = false
+        stream?.stopCapture { _ in }
+        if visible { visible = false; onChange?(false) }
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) { DispatchQueue.main.async { self.stream = nil } }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen, sb.isValid, let px = CMSampleBufferGetImageBuffer(sb) else { return }
+        CVPixelBufferLockBaseAddress(px, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(px, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(px) else { return }
+        let w = CVPixelBufferGetWidth(px), h = CVPixelBufferGetHeight(px), st = CVPixelBufferGetBytesPerRow(px)
+        let p = base.assumingMemoryBound(to: UInt8.self)
+        var lit = 0, n = 0
+        for side in sides {
+            for x in Int(side.lowerBound * Double(w))..<Int(side.upperBound * Double(w)) {
+                for y in 0..<h {
+                    let o = y * st + x * 4
+                    if max(p[o], p[o + 1], p[o + 2]) > 24 { lit += 1 }
+                    n += 1
+                }
+            }
+        }
+        // Shows after 2 lit frames in a row; hides after 3 plain-black frames, so it never flickers.
+        let seen = n > 0 && Double(lit) / Double(n) >= 0.03
+        blackFrames = seen ? 0 : blackFrames + 1
+        litFrames = seen ? litFrames + 1 : 0
+        let v = litFrames >= 2 || (visible && blackFrames < 3)
+        DispatchQueue.main.async {
+            guard self.running, v != self.visible else { return }
+            self.visible = v
+            self.onChange?(v)
+        }
+    }
+}
+
 // MARK: - Per-display session
 
 final class Session {
     let cfg: Config
     let screen: NSScreen
     let displayID: CGDirectDisplayID
-    var panel: OverlayPanel?
-    var view: OverlayView?
+    var bandPanel: OverlayPanel?
+    var barsPanel: OverlayPanel?
+    var bandView: BandView?
+    var barsView: BarsView?
     var sampler: Sampler?
     var shown = false
     var current: OKLab
@@ -665,10 +910,23 @@ final class Session {
     var barRects: [CGRect] = []
     var snapNext = true
     var framesSinceShow = 0
-    var menuHoverUntil = 0.0
+    var menuBar: MenuBarWatcher?
     var barCache: [String: [CGRect]] = [:]
     var fsSpaces = 0
     var pendingUntil = 0.0
+    var holdUntil = 0.0
+    var steady: (bounds: CGRect, since: Double)?
+    var exiting = false
+    var exitAt = 0.0
+    var appPID: pid_t?
+    var settledSpace = false
+    var bandYielded = false
+    var menuSeenAt = 0.0
+    var knownFS = Set<UInt64>()
+    var pinned = false
+    var memberSpaces = Set<UInt64>()
+    var lastSweep = 0.0
+    var shownAt = 0.0
     var shownKey: String?
 
     init(cfg: Config, screen: NSScreen, color: OKLab) {
@@ -677,30 +935,144 @@ final class Session {
         displayID = Display.id(of: screen)
         current = color
         target = color
-        makePanel()
+        makePanels()
     }
 
     func tearDown() {
         hide()
         sampler?.stop(); sampler = nil
-        panel?.orderOut(nil); panel = nil; view = nil
+        menuBar?.stop(); menuBar = nil
+        bandPanel?.orderOut(nil); barsPanel?.orderOut(nil)
+        bandPanel = nil; barsPanel = nil; bandView = nil; barsView = nil
     }
 
-    // Drive show/hide from full-screen state. The notch band panel joins full-screen spaces on its own
-    // (canJoinAllSpaces), so we never add or remove our windows from spaces by hand -- a stuck full-screen
-    // window used to cover the desktop wallpaper. We only ever order the band in (full screen) or out.
+    // Drive show/hide from full-screen state. Our two windows are members of full-screen Spaces only:
+    // they join a new one the moment the system creates it, so the system draws them as part of that
+    // Space from the first frame of its slide (in and out), and they never belong to a desktop Space.
     func refresh() {
         let now = CACurrentMediaTime()
-        let n = Display.fullScreenSpaceIDs(screen).count
+        let ids = Display.fullScreenSpaceIDs(screen)
+        let fresh = ids.subtracting(knownFS)
+        knownFS = ids
+        memberSpaces.formIntersection(ids)
+        if !fresh.isEmpty { adopt(fresh) }
+        if now - lastSweep >= 0.5 { lastSweep = now; sweep() }
+        let n = ids.count
         if n > fsSpaces { pendingUntil = now + 1.5 }
         if n < fsSpaces { pendingUntil = 0 }
         fsSpaces = n
-        if let why = Display.fullScreenReason(screen) ?? (Session.pluginFullScreen(on: screen) ? "IINA plugin: full screen" : nil) {
-            pendingUntil = 0; show(why: why)
+        let reason = Display.fullScreenReason(screen)
+        let settled = reason == "native full-screen space"
+        if settled && !settledSpace {
+            menuBar?.reset()   // only frames from the full-screen Space count
+            if shown { pin() }
         }
-        else if now < pendingUntil { show(why: "full-screen transition") }
-        else { hide() }
+        settledSpace = settled
+        if shown { applyMenuBar() }
+        if let why = reason ?? (Session.pluginFullScreen(on: screen) ? "IINA plugin: full screen" : nil) {
+            pendingUntil = 0; holdUntil = 0; show(why: why)
+        }
+        else if now < pendingUntil { holdUntil = 0; show(why: "full-screen transition") }
+        else if shown, holdUntil == 0 { holdUntil = now + Session.exitHold }
+        else if now >= holdUntil { holdUntil = 0; hide() }
+        if shown { watchForExit(now) }
     }
+
+    // Space handling, measured frame by frame (2026-10-11): the system's slide into a new full-screen
+    // Space never includes third-party windows, so entering keeps the windows on every Space
+    // (`roaming`, which leaves the shortest black after the slide). Once the system has settled in
+    // the full-screen Space they are pinned to it: leaving then slides them out with the Space with no
+    // black frame, and swiping back to the desktop never carries them along.
+    static let roaming: NSWindow.CollectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+    static let pinnedBehavior: NSWindow.CollectionBehavior = [.fullScreenAuxiliary, .ignoresCycle]
+
+    private func adopt(_ ids: Set<UInt64>) {
+        memberSpaces.formUnion(ids)
+        NSLog("matte-fill: [\(screen.localizedName)] full-screen Space \(ids.sorted()) appeared")
+        if let bandPanel, let barsPanel {   // members from its creation, in case the slide snapshot honours it
+            for p in [barsPanel, bandPanel] where !p.isVisible { p.alphaValue = 0; p.orderFrontRegardless() }
+            SLSAddWindowsToSpaces(CGSMainConnectionID(), [bandPanel.windowNumber, barsPanel.windowNumber] as CFArray, Array(ids) as CFArray)
+        }
+        if pinned { pin() }
+    }
+
+    private func pin() {
+        guard let bandPanel, let barsPanel, !memberSpaces.isEmpty else { return }
+        pinned = true
+        for p in [barsPanel, bandPanel] { p.collectionBehavior = Session.pinnedBehavior }
+        SLSAddWindowsToSpaces(CGSMainConnectionID(), [bandPanel.windowNumber, barsPanel.windowNumber] as CFArray, Array(memberSpaces) as CFArray)
+        lastSweep = 0; sweep()
+    }
+
+    private func unpin() {
+        pinned = false
+        for p in [barsPanel, bandPanel] { p?.collectionBehavior = Session.roaming }
+    }
+
+    // Safety net, every 0.5 s while pinned: our windows must never sit on a desktop (non-full-screen) Space.
+    private func sweep() {
+        guard pinned, !memberSpaces.isEmpty, let bandPanel, let barsPanel else { return }
+        let others = Display.allSpaceIDs().subtracting(memberSpaces)
+        guard !others.isEmpty else { return }
+        SLSRemoveWindowsFromSpaces(CGSMainConnectionID(), [bandPanel.windowNumber, barsPanel.windowNumber] as CFArray, Array(others) as CFArray)
+    }
+
+    // Exit mirrors entry: entering, the band appears as the system transition starts and the bars ease
+    // in once it is over; leaving, the bars ease back out as soon as the system starts its exit, and the
+    // band goes when the system's slide takes over. The system gives ~0.6 s between the app's
+    // full-screen window starting to change and the Space switch, so the same curve runs over that.
+    static let exitFadeSeconds = 0.6
+
+    // The app's full-screen window, once its bounds have held still for 0.5 s, is the steady state; any
+    // later change in it (the system's exit animation replaces or resizes it) starts the exit.
+    private func watchForExit(_ now: Double) {
+        let b = appPID.flatMap { Session.mainWindowBounds(screen, pid: $0) }
+        // Learning: only once the system has switched to the full-screen Space, and only a window that
+        // fills the screen and then holds still for 0.5 s; while entering, the window still changes.
+        guard let st = steady, st.since == 0 else {
+            if settledSpace, let b, fillsScreen(b) {
+                if let st = steady, st.bounds == b { if now - st.since >= 0.5 { steady = (b, 0) } }   // 0 marks it settled
+                else { steady = (b, now) }
+            } else { steady = nil }
+            return
+        }
+        if exiting, b == st.bounds || now - exitAt > 1.5 {
+            // Not an exit after all (still in full screen): relearn the window; the sampler brings the
+            // bars back with the normal ease-in.
+            exiting = false; steady = nil
+            NSLog("matte-fill: [\(screen.localizedName)] exit cancelled")
+            return
+        }
+        if st.since == 0, b != st.bounds, !exiting {
+            exiting = true; exitAt = now
+            applyMenuBar()
+            NSLog("matte-fill: [\(screen.localizedName)] exit started, bars ease out over \(Session.exitFadeSeconds)s")
+            barRects = []
+            barsView?.setRects([], animated: true, duration: Session.exitFadeSeconds)
+        }
+    }
+
+    // A full-screen window covers the whole display below the menu bar area.
+    private func fillsScreen(_ r: CGRect) -> Bool {
+        let d = CGDisplayBounds(displayID)
+        return r.minX <= d.minX + 1 && r.maxX >= d.maxX - 1 && r.maxY >= d.maxY - 1 && r.minY <= d.minY + bandRect.height + 1
+    }
+
+    // Bounds of the full-screen app's largest on-screen window that covers most of this display.
+    static func mainWindowBounds(_ screen: NSScreen, pid: pid_t) -> CGRect? {
+        let d = CGDisplayBounds(Display.id(of: screen))
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        return list.compactMap { w -> CGRect? in
+            guard (w[kCGWindowOwnerPID as String] as? Int32) == pid, (w[kCGWindowLayer as String] as? Int) == 0,
+                  let bd = w[kCGWindowBounds as String] as? NSDictionary, let r = CGRect(dictionaryRepresentation: bd),
+                  r.intersection(d).width * r.intersection(d).height >= 0.8 * d.width * d.height else { return nil }
+            return r
+        }.max { $0.width * $0.height < $1.width * $1.height }
+    }
+
+    // Leaving full screen, the Space switches ~0.2 s before the system's slide starts drawing (a
+    // snapshot that still holds our colors); staying that long hands over to it without a black frame.
+    static let exitHold = 0.3
 
     // The IINA plugin reports full screen as its transition starts, before a Space appears (and legacy
     // full screen never makes one).
@@ -722,11 +1094,11 @@ final class Session {
         return Date().timeIntervalSince(mtime) < 3
     }
 
-    private func makePanel() {
+    private func makePanel(level: Int) -> OverlayPanel {
         let f = screen.frame
         let p = OverlayPanel(contentRect: f, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        p.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.mainMenuWindow)) + 1)  // the menu bar itself paints the notch band black
-        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        p.level = NSWindow.Level(rawValue: level)
+        p.collectionBehavior = Session.roaming
         p.ignoresMouseEvents = true
         p.isOpaque = false
         p.backgroundColor = .clear
@@ -735,16 +1107,34 @@ final class Session {
         p.isReleasedWhenClosed = false
         p.animationBehavior = .none
         p.setFrame(f, display: false)
-        let v = OverlayView(frame: NSRect(origin: .zero, size: f.size))
-        p.contentView = v
-        v.setColor(current)
-        // Overlap the content below by a few points: the notch band and whatever colors the area
-        // under it meet exactly at safeAreaInsets.top, and rounding there leaves a 1px black seam.
-        bandRect = CGRect(x: 0, y: 0, width: f.width, height: screen.safeAreaInsets.top + (screen.safeAreaInsets.top > 0 ? 4 : 0))
-        v.setBand(bandRect)
-        v.setRects([])
         p.alphaValue = 0
-        panel = p; view = v
+        return p
+    }
+
+    // Two windows, each at the lowest level its job allows, so nothing of the system is ever covered:
+    // the band sits just above the menu bar and covers exactly what it paints black, the bars just above the
+    // full-screen app, below notifications, HUDs, menus and every other system window.
+    private func makePanels() {
+        let f = screen.frame
+        let bp = makePanel(level: Int(CGWindowLevelForKey(.mainMenuWindow)) + 1)
+        let bv = BandView(frame: NSRect(origin: .zero, size: f.size))
+        bp.contentView = bv
+        bv.setColor(ColorMath.cgColor(current))
+        bandRect = CGRect(x: 0, y: 0, width: f.width, height: Display.menuBarHeight(screen))
+        NSLog("matte-fill: [\(screen.localizedName)] notch band height \(bandRect.height) (safe area \(screen.safeAreaInsets.top))")
+        bv.setBand(bandRect)
+        let rp = makePanel(level: Int(CGWindowLevelForKey(.normalWindow)) + 1)
+        let rv = BarsView(frame: NSRect(origin: .zero, size: f.size))
+        rv.fadeSeconds = cfg.fadeSeconds
+        rp.contentView = rv
+        rv.setColor(ColorMath.cgColor(current))
+        bandPanel = bp; barsPanel = rp; bandView = bv; barsView = rv
+        if bandRect.height > 0 {
+            let m = MenuBarWatcher(screen: screen)
+            m.onChange = { [weak self] _ in self?.applyMenuBar() }
+            m.prepare(displayID: displayID, height: bandRect.height)
+            menuBar = m
+        }
         if cfg.adaptive || cfg.coverBars {
             let s = Sampler(cfg: cfg, bandFraction: Double(screen.safeAreaInsets.top / f.height), screenSize: f.size)
             s.onAnalysis = { [weak self] a in
@@ -755,74 +1145,102 @@ final class Session {
                 self.framesSinceShow += 1
                 if let c = a.color {
                     self.target = c
-                    if self.snapNext { self.current = c; self.snapNext = false; self.view?.setColor(c) }   // first sample: no fade
+                    if self.snapNext { self.current = c; self.snapNext = false; self.setColor(c) }   // first sample: no fade
                 }
-                if a.rects != self.barRects || self.view?.mirrorEnabled != !a.rects.isEmpty { self.applyBars(a.rects, live: true) }
+                if !self.exiting, a.rects != self.barRects { self.applyBars(a.rects) }
                 if let k = self.shownKey, self.framesSinceShow > 3 { self.barCache[k] = a.rects }
             }
-            s.onMirror = { [weak self] px in self?.view?.setMirror(px) }
+            s.onMirror = { [weak self] px in self?.barsView?.setMirror(px) }
             sampler = s
-            let did = displayID, wid = CGWindowID(p.windowNumber)
+            let did = displayID, wid = CGWindowID(bp.windowNumber)
             s.onLost = { [weak s] in s?.prepare(displayID: did, excludeWindowID: wid) }
             s.prepare(displayID: did, excludeWindowID: wid)
         }
     }
 
+    // The band yields only to the full-screen Space's own menu bar: while the system is still switching
+    // Spaces (entering or leaving) the strip shows the desktop's menu bar, and the band stays put.
+    private func applyMenuBar() {
+        let now = CACurrentMediaTime()
+        let seen = (menuBar?.visible ?? false) && settledSpace && steady?.since == 0 && !exiting
+        if !seen { menuSeenAt = 0 } else if menuSeenAt == 0 { menuSeenAt = now }
+        // The menu bar must stay out for 0.15 s: leaving full screen flashes it for a frame or two.
+        let yield = seen && now - menuSeenAt >= 0.15
+        guard yield != bandYielded else { return }
+        bandYielded = yield
+        NSLog("matte-fill: [\(screen.localizedName)] \(yield ? "menu bar shown, band yields" : "band back")")
+        bandView?.setBandVisible(!yield)
+    }
+
+    private func setColor(_ c: OKLab) {
+        let cg = ColorMath.cgColor(c)
+        bandView?.setColor(cg)
+        barsView?.setColor(cg)
+    }
+
     private func show(why: String) {
-        guard !shown, let panel else { return }
+        guard !shown, let bandPanel, let barsPanel else { return }
         shown = true
         snapNext = true
         framesSinceShow = 0
+        steady = nil
+        exiting = false
         let front = NSWorkspace.shared.frontmostApplication
+        appPID = front?.processIdentifier
         let native = Session.nativelyHandled(front)
         NSLog("matte-fill: [\(screen.localizedName)] show [\(why)]\(native ? " (IINA plugin)" : "") (capture access: \(CGPreflightScreenCaptureAccess()))")
-        panel.setFrame(screen.frame, display: false)
+        for p in [bandPanel, barsPanel] { p.setFrame(screen.frame, display: false) }
         shownKey = Display.fullScreenWindowKey(screen)
         if native, let c = ShotAnalyzer.lastColor {
             // mpv's background already shows the color of the latest analyzed frame; start from it
             // and ease toward live samples instead of snapping.
-            current = c; target = c; snapNext = false; view?.setColor(c)
-        }
-        if let k = shownKey, let cached = barCache[k], !native {
-            applyBars(cached, live: true)   // same window as before: exact bars, no flash
-        } else if !native, CGPreflightScreenCaptureAccess() {
-            // No cached geometry: cover the whole screen with our color at once, so the app's black
-            // bars never show. The sampler carves the video region out on its first frame (~0.1 s),
-            // turning the old black->color jump into a color->video reveal. A safety timer clears the
-            // cover if no frame ever arrives, so a stalled capture can never hide the video.
-            let full = [CGRect(origin: .zero, size: screen.frame.size)]
-            applyBars(full, live: false)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-                guard let self, self.shown, self.framesSinceShow == 0 else { return }
-                self.applyBars([], live: false)
-            }
+            current = c; target = c; snapNext = false; setColor(c)
         }
         sampler?.barsEnabled = !native
-        if native { applyBars([], live: false) }
-        panel.orderFrontRegardless()
-        panel.alphaValue = 1
-        if cfg.fadeSeconds > 0.01 { view?.fadeInLetterbox(cfg.fadeSeconds) }
+        if let k = shownKey, let cached = barCache[k], !native { applyBars(cached) }   // same window as before
+        shownAt = CACurrentMediaTime()
+        for p in [barsPanel, bandPanel] { p.orderFrontRegardless(); p.alphaValue = 1 }
+        if settledSpace { pin() }
         sampler?.start()
+        menuBar?.start()
         if let pid = front?.processIdentifier { sampler?.focus(pid: pid) }
     }
 
     func hide() {
         guard shown else { return }
         shown = false
+        exiting = false
+        steady = nil
         NSLog("matte-fill: [\(screen.localizedName)] hide (last color \(ColorMath.hex(current)))")
         sampler?.stop()
-        panel?.orderOut(nil)
-        applyBars([], live: false)
-        view?.setMirror(nil)
+        menuBar?.stop()
+        bandYielded = false
+        bandView?.setBandVisible(true)
+        bandPanel?.orderOut(nil); barsPanel?.orderOut(nil)
+        bandPanel?.alphaValue = 0; barsPanel?.alphaValue = 0
+        unpin()
+        barRects = []
+        barsView?.setRects([], animated: false)
+        barsView?.mirrorEnabled = false
+        barsView?.setMirror(nil)
     }
 
-    // `live` is false for the provisional full-screen cover, where a mirror would wash the video out.
-    private func applyBars(_ rects: [CGRect], live: Bool) {
+    // Bars ease in, out and between sizes (BarsView); the mirror runs only while some bar is painted.
+    private func applyBars(_ rects: [CGRect]) {
+        if barRects.isEmpty, !rects.isEmpty { NSLog("matte-fill: [\(screen.localizedName)] bars ease in over \(cfg.fadeSeconds)s") }
         barRects = rects
-        view?.setRects(rects)
-        let on = live && !rects.isEmpty
-        view?.mirrorEnabled = on
-        if shown { sampler?.setMirror(!rects.isEmpty) }   // warms up during the provisional cover too
+        barsView?.setRects(rects, animated: cfg.fadeSeconds > 0.01)
+        if !rects.isEmpty {
+            barsView?.mirrorEnabled = true
+            if shown { sampler?.setMirror(true) }
+            return
+        }
+        // Keep passing the app's UI through until the leaving bars have fully faded out.
+        DispatchQueue.main.asyncAfter(deadline: .now() + cfg.fadeSeconds) { [weak self] in
+            guard let self, self.barRects.isEmpty else { return }
+            self.barsView?.mirrorEnabled = false
+            self.sampler?.setMirror(false)
+        }
     }
 
     // Exponential smoothing toward the sampled target; the first sample after entering full screen snaps.
@@ -832,78 +1250,14 @@ final class Session {
         current = OKLab(L: current.L + (target.L - current.L) * k,
                         a: current.a + (target.a - current.a) * k,
                         b: current.b + (target.b - current.b) * k)
-        view?.setColor(current)
+        setColor(current)
         let (r, g, b) = ColorMath.toSRGB(current)
         sampler?.tintBytes = (Int(r * 255 + 0.5), Int(g * 255 + 0.5), Int(b * 255 + 0.5))
-        if let f = panel?.frame {
-            let m = NSEvent.mouseLocation
-            let atTop = f.contains(m) && m.y >= f.maxY - bandRect.height - 8
-            if atTop { menuHoverUntil = now + 0.6 }
-            view?.setBandVisible(now > menuHoverUntil)
-        }
     }
 
     var stateJSON: String {
         let f = screen.frame
         return "{\"id\":\(displayID),\"x\":\(f.minX),\"y\":\(f.minY),\"w\":\(f.width),\"h\":\(f.height),\"top\":\(screen.safeAreaInsets.top),\"active\":\(shown),\"color\":\"\(ColorMath.hex(current))\"}"
-    }
-}
-
-// MARK: - Instant full-screen switching (optional, fully reversible)
-
-// Makes entering/leaving full screen instant, so app content reaches full size as fast as our own
-// strip instead of a beat behind it. Two global toggles: Dock's swoosh removes the Space slide (and
-// its black seam); Reduce Motion removes the window's zoom-into-full-screen animation. Each original
-// value is saved before the first change and put back on quit; a marker file lets the next launch
-// reconcile after a crash. Applying/restoring relaunches Dock (windows and full screen are kept).
-enum SwooshControl {
-    static let marker = Config.dir.appendingPathComponent("instant-original.json")
-    private static let toggles: [(domain: String, key: String)] = [
-        ("com.apple.dock", "workspaces-swoosh-animation-off"),   // no Space slide (keeps app animations)
-    ]
-
-    private static func value(_ d: String, _ k: String) -> Bool? { UserDefaults(suiteName: d)?.object(forKey: k) as? Bool }
-    private static func defaults(_ args: [String]) {
-        let p = Process(); p.launchPath = "/usr/bin/defaults"; p.arguments = args
-        try? p.run(); p.waitUntilExit()
-    }
-    private static func restartDock() {
-        let p = Process(); p.launchPath = "/usr/bin/killall"; p.arguments = ["Dock"]
-        try? p.run(); p.waitUntilExit()
-    }
-
-    static var changed: Bool { FileManager.default.fileExists(atPath: marker.path) }
-
-    // Turn both toggles on, remembering each original value exactly once.
-    static func enable() {
-        if changed { return }                 // already ours; avoids repeated Dock restarts
-        var orig: [String: [String: Bool]] = [:]
-        for t in toggles {
-            let v = value(t.domain, t.key)
-            orig["\(t.domain)/\(t.key)"] = ["existed": v != nil, "value": v ?? false]
-        }
-        try? FileManager.default.createDirectory(at: Config.dir, withIntermediateDirectories: true)
-        if let d = try? JSONSerialization.data(withJSONObject: orig) { try? d.write(to: marker) }
-        for t in toggles { defaults(["write", t.domain, t.key, "-bool", "true"]) }
-        restartDock()
-        NSLog("matte-fill: instant switch ON")
-    }
-
-    // Put back exactly what was there before we touched it.
-    static func restore() {
-        guard let data = try? Data(contentsOf: marker),
-              let o = try? JSONSerialization.jsonObject(with: data) as? [String: [String: Bool]] else { return }
-        for t in toggles {
-            let e = o["\(t.domain)/\(t.key)"]
-            if e?["existed"] == true, let v = e?["value"] {
-                defaults(["write", t.domain, t.key, "-bool", v ? "true" : "false"])
-            } else {
-                defaults(["delete", t.domain, t.key])
-            }
-        }
-        try? FileManager.default.removeItem(at: marker)
-        restartDock()
-        NSLog("matte-fill: instant switch restored")
     }
 }
 
@@ -962,8 +1316,6 @@ final class Controller: NSObject {
             rebuild()
         }
         ShotAnalyzer.poll(cfg: cfg)
-        if cfg.instantSpaceSwitch { SwooshControl.enable() }
-        else if SwooshControl.changed { SwooshControl.restore() }
     }
 
     // The IINA plugin reads this: per target display, its frame, whether we are active there and the color.
@@ -1010,44 +1362,35 @@ if args.contains("--request-capture") {
     print("granted:", CGRequestScreenCaptureAccess())
     exit(0)
 }
-// Turn instant Space switching on or off; the running agent applies or restores it within a second.
-if let i = args.firstIndex(of: "--instant") {
-    guard i + 1 < args.count, ["on", "off"].contains(args[i + 1]) else {
-        print("usage: matte-fill --instant on|off"); exit(2)
-    }
-    var obj = (try? Data(contentsOf: Config.file)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
-    obj["instantSpaceSwitch"] = args[i + 1] == "on"
-    try? FileManager.default.createDirectory(at: Config.dir, withIntermediateDirectories: true)
-    let data = try! JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
-    try! data.write(to: Config.file, options: .atomic)
-    print("instantSpaceSwitch:", args[i + 1])
-    exit(0)
-}
 // Offline self-test of the IINA shot analysis: prints the JSON verdict the plugin would receive.
 if let i = args.firstIndex(of: "--analyze-shot"), i + 1 < args.count {
     print(ShotAnalyzer.analyze(URL(fileURLWithPath: args[i + 1]), cfg: Config.load()) ?? "unreadable")
     exit(0)
 }
 
-// Offline self-test: feed a screenshot for 2 simulated seconds and print what would be painted.
+// Offline self-test: feed screenshots in order, each as 2 simulated seconds of playback, and print what
+// would be painted after each (several files simulate UI appearing, layout changes and so on).
 if let i = args.firstIndex(of: "--analyze"), i + 1 < args.count,
-   let src = NSImage(contentsOfFile: args[i + 1])?.cgImage(forProposedRect: nil, context: nil, hints: nil),
    let screen = Display.targetScreens(Config.load()).first ?? NSScreen.main {
     let w = Int(screen.frame.width) / 2, h = Int(screen.frame.height) / 2
-    let (pw, ph) = (w, h)
-    var pb: CVPixelBuffer?
-    CVPixelBufferCreate(nil, pw, ph, kCVPixelFormatType_32BGRA, nil, &pb)
-    CVPixelBufferLockBaseAddress(pb!, [])
-    let ctx = CGContext(data: CVPixelBufferGetBaseAddress(pb!), width: pw, height: ph, bitsPerComponent: 8,
-                        bytesPerRow: CVPixelBufferGetBytesPerRow(pb!), space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                        bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)!
-    ctx.draw(src, in: CGRect(x: 0, y: 0, width: pw, height: ph))
-    CVPixelBufferUnlockBaseAddress(pb!, [])
     let s = Sampler(cfg: Config.load(), bandFraction: Double(screen.safeAreaInsets.top / screen.frame.height), screenSize: screen.frame.size)
-    var a = Analysis(color: nil, rects: [])
-    for k in 0...20 { a = s.analyze(pb!, now: Double(k) * 0.1) }
-    print("color:", a.color.map(ColorMath.hex) ?? "none")
-    for r in a.rects { print("rect:", r) }
+    var t = 0.0
+    for path in args[(i + 1)...] {
+        guard let src = NSImage(contentsOfFile: path)?.cgImage(forProposedRect: nil, context: nil, hints: nil) else { print("unreadable:", path); continue }
+        var pb: CVPixelBuffer?
+        CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, nil, &pb)
+        CVPixelBufferLockBaseAddress(pb!, [])
+        let ctx = CGContext(data: CVPixelBufferGetBaseAddress(pb!), width: w, height: h, bitsPerComponent: 8,
+                            bytesPerRow: CVPixelBufferGetBytesPerRow(pb!), space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)!
+        ctx.draw(src, in: CGRect(x: 0, y: 0, width: w, height: h))
+        CVPixelBufferUnlockBaseAddress(pb!, [])
+        var a = Analysis(color: nil, rects: [])
+        for _ in 0...20 { a = s.analyze(pb!, now: t); t += 0.1 }
+        if args.count > i + 2 { print("after", (path as NSString).lastPathComponent) }
+        print("color:", a.color.map(ColorMath.hex) ?? "none")
+        for r in a.rects { print("rect:", r) }
+    }
     exit(0)
 }
 
@@ -1059,27 +1402,15 @@ if args.contains("--preview"), let screen = Display.targetScreens(Config.load())
     p.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.mainMenuWindow)) + 1)
     p.isOpaque = false; p.backgroundColor = .clear; p.ignoresMouseEvents = true
     p.setFrame(screen.frame, display: false)
-    let v = OverlayView(frame: NSRect(origin: .zero, size: screen.frame.size))
+    let v = BarsView(frame: NSRect(origin: .zero, size: screen.frame.size))
     p.contentView = v
-    v.setColor(ColorMath.fromHex("#C04040"))
-    v.setRects([CGRect(x: 0, y: 0, width: screen.frame.width, height: screen.safeAreaInsets.top),
-                CGRect(x: 0, y: screen.safeAreaInsets.top, width: 300, height: 100)])
+    v.setColor(ColorMath.cgColor(ColorMath.fromHex("#C04040")))
+    v.setRects([CGRect(x: 0, y: screen.safeAreaInsets.top, width: screen.frame.width, height: 100)], animated: false)
     p.orderFrontRegardless()
     DispatchQueue.main.asyncAfter(deadline: .now() + 2) { exit(0) }
     app.run()
 }   // no Dock icon, never takes focus
 NSLog("matte-fill: started (capture access: \(CGPreflightScreenCaptureAccess()))")
-// Restore any system setting we changed (instant Space switch) when the agent is asked to quit, so
-// stopping the agent always returns the system to how it was.
-atexit { if SwooshControl.changed { SwooshControl.restore() } }
-var signalSources: [DispatchSourceSignal] = []
-for sig in [SIGTERM, SIGINT] {
-    signal(sig, SIG_IGN)
-    let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
-    src.setEventHandler { if SwooshControl.changed { SwooshControl.restore() }; exit(0) }
-    src.resume()
-    signalSources.append(src)
-}
 let controller = Controller()
 controller.run()
 app.run()
