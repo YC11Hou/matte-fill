@@ -796,6 +796,60 @@ enum ShotAnalyzer {
     }
 }
 
+// MARK: - Protected (DRM) playback
+
+// Browsers black out DRM video (HBO Max, Netflix...) while any screen capture is running on the system,
+// so Matte must capture nothing while such video plays. Detected without capturing: Chromium browsers
+// decrypt in their own CDM utility processes, whose CPU time only grows while protected video plays.
+final class ProtectedPlayback {
+    private var cdms: [pid_t: [pid_t]] = [:]            // app pid -> its CDM child processes
+    private var listedAt: [pid_t: Double] = [:]
+    private var samples: [pid_t: [(t: Double, cpu: Double)]] = [:]
+    private static let timebase: Double = {
+        var tb = mach_timebase_info_data_t(); mach_timebase_info(&tb)
+        return Double(tb.numer) / Double(tb.denom)
+    }()
+
+    // True while the app's CDM has used CPU within the last 2 s (decrypting, i.e. playing).
+    func playing(app: pid_t, now: Double) -> Bool {
+        if now - (listedAt[app] ?? -100) > 5 { cdms[app] = ProtectedPlayback.cdmChildren(of: app); listedAt[app] = now }
+        var busy = false
+        for pid in cdms[app] ?? [] {
+            guard let cpu = ProtectedPlayback.cpuSeconds(pid) else { continue }
+            var s = samples[pid] ?? []
+            s.append((now, cpu)); s.removeAll { now - $0.t > 2.5 }
+            samples[pid] = s
+            if let first = s.first, now - first.t >= 0.4, cpu - first.cpu > 0.003 * (now - first.t) { busy = true }
+        }
+        return busy
+    }
+
+    static func cdmChildren(of app: pid_t) -> [pid_t] {
+        var pids = [pid_t](repeating: 0, count: 8192)
+        let n = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size)))
+        return pids.prefix(max(0, n)).filter { pid in
+            var info = proc_bsdinfo()
+            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)) > 0,
+                  pid_t(info.pbi_ppid) == app else { return false }
+            return arguments(pid).contains("CdmServiceBroker")
+        }
+    }
+
+    private static func arguments(_ pid: pid_t) -> String {
+        var mib = [CTL_KERN, KERN_PROCARGS2, pid], size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 0 else { return "" }
+        var buf = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0 else { return "" }
+        return String(decoding: buf.prefix(size).map { $0 == 0 ? 32 : $0 }, as: UTF8.self)
+    }
+
+    private static func cpuSeconds(_ pid: pid_t) -> Double? {
+        var t = proc_taskinfo()
+        guard proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &t, Int32(MemoryLayout<proc_taskinfo>.size)) > 0 else { return nil }
+        return Double(t.pti_total_user + t.pti_total_system) * timebase / 1e9
+    }
+}
+
 // MARK: - Menu bar watcher
 
 // Watches what lies under the notch band (our own windows excluded): while the full-screen menu bar is
@@ -921,6 +975,9 @@ final class Session {
     var appPID: pid_t?
     var settledSpace = false
     var bandYielded = false
+    var protectedMode = false
+    let drm = ProtectedPlayback()
+    var lastDRMCheck = 0.0
     var menuSeenAt = 0.0
     var knownFS = Set<UInt64>()
     var pinned = false
@@ -976,6 +1033,28 @@ final class Session {
         else if shown, holdUntil == 0 { holdUntil = now + Session.exitHold }
         else if now >= holdUntil { holdUntil = 0; hide() }
         if shown { watchForExit(now) }
+        if now - lastDRMCheck >= 0.5, let pid = shown ? appPID : NSWorkspace.shared.frontmostApplication?.processIdentifier {
+            lastDRMCheck = now
+            if drm.playing(app: pid, now: now), shown, !protectedMode { enterProtectedMode() }
+        }
+    }
+
+    // Protected (DRM) video is playing: no capture of any kind runs from here until full screen ends,
+    // so the video never blacks out. The notch band needs no capture and stays, easing to the default
+    // color (config `fallbackColor`); in a browser's video full screen the menu bar never drops over it.
+    // The bars inside the picture can't be located without capture, so they fade out (a browser
+    // extension recolors them at the source instead).
+    private func enterProtectedMode() {
+        protectedMode = true
+        NSLog("matte-fill: [\(screen.localizedName)] protected (DRM) video playing: no capture, notch band in the default color")
+        sampler?.stop()
+        menuBar?.stop()
+        bandYielded = false
+        bandView?.setBandVisible(true)
+        target = ColorMath.fromHex(cfg.fallbackColor)
+        snapNext = false
+        if !barRects.isEmpty { applyBars([]) }
+        barsView?.mirrorEnabled = false
     }
 
     // Space handling, measured frame by frame (2026-10-11): the system's slide into a new full-screen
@@ -1138,7 +1217,7 @@ final class Session {
         if cfg.adaptive || cfg.coverBars {
             let s = Sampler(cfg: cfg, bandFraction: Double(screen.safeAreaInsets.top / f.height), screenSize: f.size)
             s.onAnalysis = { [weak self] a in
-                guard let self, self.shown else { return }
+                guard let self, self.shown, !self.protectedMode else { return }   // no stale frames once capture stopped
                 if self.framesSinceShow == 0 || (self.framesSinceShow == 25) {
                     NSLog("matte-fill: [\(self.screen.localizedName)] frame \(self.framesSinceShow) color=\(a.color.map(ColorMath.hex) ?? "-") bars=\(a.rects.count) rects \(a.rects.first.map { "first=\($0)" } ?? "")")
                 }
@@ -1161,6 +1240,7 @@ final class Session {
     // The band yields only to the full-screen Space's own menu bar: while the system is still switching
     // Spaces (entering or leaving) the strip shows the desktop's menu bar, and the band stays put.
     private func applyMenuBar() {
+        guard !protectedMode else { return }
         let now = CACurrentMediaTime()
         let seen = (menuBar?.visible ?? false) && settledSpace && steady?.since == 0 && !exiting
         if !seen { menuSeenAt = 0 } else if menuSeenAt == 0 { menuSeenAt = now }
@@ -1188,6 +1268,7 @@ final class Session {
         let front = NSWorkspace.shared.frontmostApplication
         appPID = front?.processIdentifier
         let native = Session.nativelyHandled(front)
+        let protected = appPID.map { drm.playing(app: $0, now: CACurrentMediaTime()) } ?? false
         NSLog("matte-fill: [\(screen.localizedName)] show [\(why)]\(native ? " (IINA plugin)" : "") (capture access: \(CGPreflightScreenCaptureAccess()))")
         for p in [bandPanel, barsPanel] { p.setFrame(screen.frame, display: false) }
         shownKey = Display.fullScreenWindowKey(screen)
@@ -1201,6 +1282,12 @@ final class Session {
         shownAt = CACurrentMediaTime()
         for p in [barsPanel, bandPanel] { p.orderFrontRegardless(); p.alphaValue = 1 }
         if settledSpace { pin() }
+        if protected {
+            // Already playing protected video: start in the default color and never start a capture.
+            current = ColorMath.fromHex(cfg.fallbackColor); setColor(current)
+            enterProtectedMode()
+            return
+        }
         sampler?.start()
         menuBar?.start()
         if let pid = front?.processIdentifier { sampler?.focus(pid: pid) }
@@ -1209,6 +1296,7 @@ final class Session {
     func hide() {
         guard shown else { return }
         shown = false
+        protectedMode = false
         exiting = false
         steady = nil
         NSLog("matte-fill: [\(screen.localizedName)] hide (last color \(ColorMath.hex(current)))")
