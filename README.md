@@ -18,7 +18,7 @@ Entering full screen, the notch band takes the color at once and the bars ease f
 
 A real-world run on YouTube, with the title and controls coming and going over the bars, from 2 s before entering full screen to 2 s after leaving it:
 
-https://github.com/user-attachments/assets/54a03edb-887e-445f-b026-c89aba79eb8a
+https://github.com/user-attachments/assets/7103b780-fb5f-43da-bb4a-0392b06ca35c
 
 <sub>Sintel trailer, (c) Blender Foundation, licensed CC BY 3.0. The only black left is about a tenth of a second in the notch band as macOS slides into a new full-screen Space: the system's slide doesn't draw other apps' windows.</sub>
 
