@@ -590,14 +590,19 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
     //   - an edge: a line's black run from the screen edge ends in a sharp step up into a solid stretch of
     //     picture (thin lines and text strokes don't qualify), at least 20% of lines agree on the depth,
     //     and they include one unbroken stretch (text is strokes with gaps, a picture edge is a line);
-    //     the deepest such depth wins, since UI inside a bar always sits shallower than its edge;
+    //     the deepest such depth wins, since UI inside a bar always sits shallower than its edge, unless
+    //     picture shows through shallower than it: a bar is black right up to its edge, so an unbroken,
+    //     textured stretch of lines meeting picture earlier proves that depth is a dark scene, not a bar;
     //   - no bar: at least 70% of lines show picture right at the screen edge.
     // Moving or removing a bar also needs that picture to be textured across lines: player UI (control
     // strips, panels, gradients) is flat, picture is not. Adopting a new bar doesn't, as frames often
     // start with flat sky or walls; the pair rule keeps dark scenes out instead.
     // Anything else (UI covering the edge, a dark scene) is "unknown" and leaves the bars exactly as they
     // are. New bars need a pair (both edges, or one edge and the other side black just as deep), so a
-    // dark scene can't fake one; changes apply at once in the first 2 s, later after 1 s of agreement.
+    // dark scene can't fake one. The layout is found in the first 2 s; after that it is damped, since a
+    // video's frame rarely changes while its scenes do: a refinement of a sample or two needs 1 s of
+    // agreement, anything larger 5 s, and a first bar found after 8 s (UI hid it until then) 5 s too.
+    // Only the color follows the scenes.
     private func updateBars(w: Int, h: Int, y0: Int, now: Double, dark: (Int, Int) -> Bool, level: (Int, Int) -> Int) {
         if size != (w, h) { size = (w, h); est = [0, 0, 0, 0] }
         let ch = h - y0
@@ -615,6 +620,7 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         }
         var runs = [[Int]](repeating: [], count: 4), votes = [[(d: Int, i: Int)]](repeating: [], count: 4), open = [[Int]](repeating: [], count: 4)
+        var pics = [[(d: Int, i: Int)]](repeating: [], count: 4)
         for e in 0..<4 {
             for i in lines[e] {
                 var d = 0
@@ -626,6 +632,7 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
                 for j in 0..<k where !dark(at(e, i, d + j).0, at(e, i, d + j).1) { solid += 1 }
                 let step = max(level(at(e, i, d).0, at(e, i, d).1), d + 1 < lens[e] ? level(at(e, i, d + 1).0, at(e, i, d + 1).1) : 0)
                 guard step >= 48, solid >= k * 3 / 4 else { continue }
+                pics[e].append((d, i))
                 if d < max(1, lens[e] / 50) { open[e].append(i) } else { votes[e].append((d, i)) }
             }
         }
@@ -645,7 +652,7 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         // A picture edge is one long straight line; text and icons are short strokes with gaps between
         // them. So the agreeing lines must include an unbroken stretch of at least 10% of all lines.
-        func continuous(_ e: Int, _ ls: [Int]) -> Bool {
+        func continuous(_ e: Int, _ ls: [Int], _ share: Double = 0.1) -> Bool {
             let base = e < 2 ? 0 : y0
             let ord = ls.map { ($0 - base) / 2 }.sorted()
             var best = ord.isEmpty ? 0 : 1, cur = 1
@@ -653,7 +660,27 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
                 cur = ord[k] - ord[k - 1] <= 2 ? cur + 1 : 1
                 best = max(best, cur)
             }
-            return Double(best) >= 0.1 * Double(max(1, runs[e].count))
+            return Double(best) >= share * Double(max(1, runs[e].count))
+        }
+        // Where picture shows through shallower than depth d: lines meeting textured picture right at the
+        // screen edge (4% unbroken; UI floats inside a bar, never touching the edge), or a straight picture
+        // edge at one depth held to the same 10% as any edge (icons in a bar are shorter).
+        func through(_ e: Int, _ d: Int) -> Int? {
+            func picture(_ ls: [(d: Int, i: Int)], _ share: Double) -> Bool {
+                guard ls.count >= 4, continuous(e, ls.map(\.i), share) else { return false }
+                var sum = 0.0, sq = 0.0
+                for v in ls {
+                    let p = at(e, v.i, min(lens[e] - 1, v.d + 2))
+                    let l = Double(level(p.0, p.1))
+                    sum += l; sq += l * l
+                }
+                let n = Double(ls.count), m = sum / n
+                return (sq / n - m * m).squareRoot() >= 6
+            }
+            let edge = max(1, lens[e] / 50)
+            if picture(pics[e].filter { $0.d < edge }, 0.04) { return 0 }
+            for k in Swift.stride(from: edge, to: d - 2, by: 1) where picture(votes[e].filter { abs($0.d - k) <= 1 }, 0.1) { return k }
+            return nil
         }
         func read(_ e: Int) -> Reading {
             let n = Double(max(1, runs[e].count))
@@ -663,14 +690,14 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
                 guard Double(hist[d - 1] + hist[d] + hist[d + 1]) >= 0.2 * n else { continue }
                 let k = (d - 1...d + 1).max { hist[$0] < hist[$1] }!
                 let near = votes[e].filter { abs($0.d - k) <= 1 }
-                guard continuous(e, near.map(\.i)) else { continue }
+                guard continuous(e, near.map(\.i)), through(e, k) == nil else { continue }
                 return .edge(k, textured: textured(e, near.map(\.i), k + 2), share: Double(near.count) / n)
             }
             return Double(open[e].count) >= 0.7 * n && textured(e, open[e], 1) ? .none : .unknown
         }
         let r = (0..<4).map(read)
         dbgStrict = r.map { if case .edge(let k, _, _) = $0 { return k }; if case .none = $0 { return 0 }; return -1 }
-        let settle = now - startedAt < 2 ? 0.0 : 1.0
+        let locked = now - startedAt >= 2
         for (pair, _) in [(0, ch), (1, w)] {
             let e0 = pair * 2, e1 = pair * 2 + 1
             if est[e0] == 0 && est[e1] == 0 {
@@ -687,7 +714,7 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
                 let c = d0 + d1
                 if abs(c - cand[pair].0) > 2 { cand[pair] = (c, now) }
-                if c > 0, now - cand[pair].1 >= (now - startedAt < 2 ? 0 : 0.25) { est[e0] = d0; est[e1] = d1 }
+                if c > 0, now - cand[pair].1 >= (!locked ? 0 : now - startedAt < 8 ? 0.25 : 5) { est[e0] = d0; est[e1] = d1 }
                 continue
             }
             for e in [e0, e1] {
@@ -698,9 +725,13 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
                 case .none where est[e] > 0: want = 0
                 default: want = nil
                 }
+                // Picture showing inside the current bar: it can be no deeper than where that picture starts.
+                if want == nil, est[e] > 0, let b = through(e, est[e]) { want = b }
                 guard let want else { pend[e] = (-1, 0); continue }
-                if pend[e].0 < 0 || abs(pend[e].0 - want) > 1 { pend[e] = (want, now) }
-                if now - pend[e].1 >= settle { est[e] = want; pend[e] = (-1, 0) }
+                let shrinking = want < est[e] - 2 && pend[e].0 >= 0 && pend[e].0 < est[e] - 2
+                if shrinking { pend[e].0 = max(pend[e].0, want) }
+                else if pend[e].0 < 0 || abs(pend[e].0 - want) > 1 { pend[e] = (want, now) }
+                if now - pend[e].1 >= (!locked ? 0 : abs(want - est[e]) <= 2 ? 1 : 5) { est[e] = shrinking ? pend[e].0 : want; pend[e] = (-1, 0) }
             }
         }
     }
