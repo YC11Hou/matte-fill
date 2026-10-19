@@ -893,6 +893,7 @@ final class MenuBarWatcher: NSObject, SCStreamOutput, SCStreamDelegate {
     private var running = false
     private var blackFrames = 0
     private var litFrames = 0
+    private var lastSeen: Bool?
     private let queue = DispatchQueue(label: "matte-fill.menubar")
     private let sides: [Range<Double>]   // horizontal fractions of the menu bar area beside the camera housing
 
@@ -928,13 +929,13 @@ final class MenuBarWatcher: NSObject, SCStreamOutput, SCStreamDelegate {
     // Forget what was seen so far (it may have been the desktop's menu bar during a Space switch);
     // showing then needs two lit frames in a row.
     func reset() {
-        queue.async { self.blackFrames = 0; self.litFrames = 0 }
+        queue.async { self.blackFrames = 0; self.litFrames = 0; self.lastSeen = nil }
         if visible { visible = false; onChange?(false) }
     }
 
     func start() {
         guard !running else { return }
-        running = true; blackFrames = 0
+        running = true; queue.async { self.blackFrames = 0; self.lastSeen = nil }
         stream?.startCapture { _ in }
     }
 
@@ -948,7 +949,13 @@ final class MenuBarWatcher: NSObject, SCStreamOutput, SCStreamDelegate {
     func stream(_ stream: SCStream, didStopWithError error: Error) { DispatchQueue.main.async { self.stream = nil } }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen, sb.isValid, let px = CMSampleBufferGetImageBuffer(sb) else { return }
+        guard type == .screen, sb.isValid else { return }
+        // A static strip arrives as image-less idle frames: they repeat the last observation, otherwise the
+        // black count stalls after the menu bar hides and the band never comes back.
+        guard let px = CMSampleBufferGetImageBuffer(sb) else {
+            if Self.status(sb) == .idle, lastSeen != nil { tally(lastSeen!) }
+            return
+        }
         CVPixelBufferLockBaseAddress(px, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(px, .readOnly) }
         guard let base = CVPixelBufferGetBaseAddress(px) else { return }
@@ -964,8 +971,18 @@ final class MenuBarWatcher: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
             }
         }
-        // Shows after 2 lit frames in a row; hides after 3 plain-black frames, so it never flickers.
-        let seen = n > 0 && Double(lit) / Double(n) >= 0.03
+        tally(n > 0 && Double(lit) / Double(n) >= 0.03)
+    }
+
+    private static func status(_ sb: CMSampleBuffer) -> SCFrameStatus? {
+        guard let a = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let raw = a.first?[.status] as? Int else { return nil }
+        return SCFrameStatus(rawValue: raw)
+    }
+
+    // Shows after 2 lit frames in a row; hides after 3 plain-black frames, so it never flickers.
+    private func tally(_ seen: Bool) {
+        lastSeen = seen
         blackFrames = seen ? 0 : blackFrames + 1
         litFrames = seen ? litFrames + 1 : 0
         let v = litFrames >= 2 || (visible && blackFrames < 3)
