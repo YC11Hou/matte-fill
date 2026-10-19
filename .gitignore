@@ -3,3 +3,6 @@ build/
 config.local.*
 CLAUDE.md
 tools/bars-regression/samples/
+
+# local archive of retired or undeployed experiments, never committed
+archive/
