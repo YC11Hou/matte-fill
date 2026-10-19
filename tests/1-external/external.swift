@@ -17,6 +17,9 @@ func runExternal() {
     check(!ProtectedPlayback.isBrowserCDM(spotify), "Spotify's CDM (audio) does not count")
     check(!ProtectedPlayback.isBrowserCDM(renderer), "a browser renderer without a CDM does not count")
 
+    check(ProtectedPlayback.protects([4242]), "a browser CDM alive (playing, paused or buffering): protected")
+    check(!ProtectedPlayback.protects([]), "no browser CDM: not protected")
+
     var any = false
     for settled in [false, true] { for win in [false, true] { for legacy in [false, true] { for t in [0.0, 5.0] {
         any = any || Session.captureAllowed(shown: true, protected: true, exiting: false, settledSpace: settled,

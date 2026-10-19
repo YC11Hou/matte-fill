@@ -895,27 +895,17 @@ enum ShotAnalyzer {
 final class ProtectedPlayback {
     private var cdms: [pid_t] = []                       // CDM processes of every browser
     private var listedAt = -100.0
-    private var samples: [pid_t: [(t: Double, cpu: Double)]] = [:]
-    private static let timebase: Double = {
-        var tb = mach_timebase_info_data_t(); mach_timebase_info(&tb)
-        return Double(tb.numer) / Double(tb.denom)
-    }()
 
-    // True while any browser's CDM, on any display, has used CPU within the last 2 s (decrypting, i.e.
-    // playing): a browser blacks out its protected video whenever any capture runs anywhere, so a movie on
-    // the external display is protected just as much as one on ours.
+    // True while any browser, on any display, has a CDM process alive (a page with protected video is open,
+    // playing, paused or buffering): a browser blacks out its protected video whenever any capture runs
+    // anywhere, so a movie on the external display is protected just as much as one on ours. Decryption
+    // CPU is not a usable signal: it measured flat for seconds while a movie was on (2026-10-19).
     func playing(now: Double) -> Bool {
-        if now - listedAt > 5 { cdms = ProtectedPlayback.cdmProcesses(); listedAt = now }
-        var busy = false
-        for pid in cdms {
-            guard let cpu = ProtectedPlayback.cpuSeconds(pid) else { continue }
-            var s = samples[pid] ?? []
-            s.append((now, cpu)); s.removeAll { now - $0.t > 2.5 }
-            samples[pid] = s
-            if let first = s.first, now - first.t >= 0.4, cpu - first.cpu > 0.003 * (now - first.t) { busy = true }
-        }
-        return busy
+        if now - listedAt >= 1 { cdms = ProtectedPlayback.cdmProcesses(); listedAt = now }
+        return ProtectedPlayback.protects(cdms)
     }
+
+    static func protects(_ cdmProcesses: [pid_t]) -> Bool { !cdmProcesses.isEmpty }
 
     // Browser helper processes running the CDM service (Chromium-based browsers alike). Other apps carry a
     // CDM too (Spotify, for audio) and never black anything out, so only browsers count.
@@ -942,11 +932,6 @@ final class ProtectedPlayback {
         return String(decoding: buf.prefix(size).map { $0 == 0 ? 32 : $0 }, as: UTF8.self)
     }
 
-    private static func cpuSeconds(_ pid: pid_t) -> Double? {
-        var t = proc_taskinfo()
-        guard proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &t, Int32(MemoryLayout<proc_taskinfo>.size)) > 0 else { return nil }
-        return Double(t.pti_total_user + t.pti_total_system) * timebase / 1e9
-    }
 }
 
 // MARK: - Menu bar watcher
