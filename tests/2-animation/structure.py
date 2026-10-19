@@ -96,6 +96,7 @@ made = sites(r"\bSession\(cfg:")
 check(all(o[0] == "Controller" for _, o in made) and made, "sessions are created only by the Controller")
 ctl = "\n".join(src[i] for i, o in enumerate(src) if o and owner(i)[0] == "Controller")
 check("Display.targetScreens(" in ctl, "the Controller builds sessions from Display.targetScreens only")
+check("p.frame != screen.frame" in body("Session", "refresh"), "every refresh puts a window that drifted off its display back")
 
 print("structure: all passed" if fails == 0 else f"structure: {fails} FAILED")
 sys.exit(1 if fails else 0)

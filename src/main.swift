@@ -641,6 +641,10 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private enum Reading { case edge(Int, textured: Bool, share: Double), none, unknown }
 
+    // Even in the first 2 s a bar edge has to hold one depth this long: a video's frame holds still, while the
+    // system's full-screen zoom (in or out) moves the picture's edges over a dark desktop every frame.
+    static let settle = 0.25
+
     // Bars belong to the video's layout, which changes rarely; player UI (controls, titles, subtitles,
     // danmaku, hints) comes and goes on top of them. So a bar only moves or goes on positive evidence:
     //   - an edge: a line's black run from the screen edge ends in a sharp step up into a solid stretch of
@@ -770,7 +774,7 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
                 let c = d0 + d1
                 if abs(c - cand[pair].0) > 2 { cand[pair] = (c, now) }
-                if c > 0, moving, now - cand[pair].1 >= (!locked ? 0 : now - startedAt < 8 ? 0.25 : 5) { est[e0] = d0; est[e1] = d1 }
+                if c > 0, moving, now - cand[pair].1 >= (!locked ? Sampler.settle : now - startedAt < 8 ? 0.25 : 5) { est[e0] = d0; est[e1] = d1 }
                 continue
             }
             for e in [e0, e1] {
@@ -787,7 +791,7 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
                 let shrinking = want < est[e] - 2 && pend[e].0 >= 0 && pend[e].0 < est[e] - 2
                 if shrinking { pend[e].0 = max(pend[e].0, want) }
                 else if pend[e].0 < 0 || abs(pend[e].0 - want) > 1 { pend[e] = (want, now) }
-                if now - pend[e].1 >= (!locked ? 0 : abs(want - est[e]) <= 2 ? 1 : 5) { est[e] = shrinking ? pend[e].0 : want; pend[e] = (-1, 0) }
+                if now - pend[e].1 >= (!locked ? Sampler.settle : abs(want - est[e]) <= 2 ? 1 : 5) { est[e] = shrinking ? pend[e].0 : want; pend[e] = (-1, 0) }
             }
         }
     }
@@ -1153,6 +1157,12 @@ final class Session {
     // Space from the first frame of its slide (in and out), and they never belong to a desktop Space.
     func refresh() {
         let now = CACurrentMediaTime()
+        // Requirement 1 at run time: our windows never sit on another display (the system moves windows
+        // when displays are rearranged); one that drifted is put straight back.
+        for p in [bandPanel, barsPanel].compactMap({ $0 }) where p.frame != screen.frame {
+            NSLog("matte-fill: [\(screen.localizedName)] window \(p.windowNumber) was at \(p.frame), put back on \(screen.frame)")
+            p.setFrame(screen.frame, display: false)
+        }
         let ids = Display.fullScreenSpaceIDs(screen)
         let fresh = ids.subtracting(knownFS)
         knownFS = ids
@@ -1704,8 +1714,11 @@ if let i = args.firstIndex(of: "--analyze"), i + 1 < args.count,
     let s = Sampler(cfg: fixedScreen == nil ? Config.load() : Config(), bandFraction: Double(top / size.height), screenSize: size)
     s.assumeMotion = !args.contains("--still")
     var t = 0.0
-    var skip: Set<String> = ["--still", "--screen"]
+    // `--hold S`: each image stands for S seconds of frames (default 2 s at 10 fps); `--transition` and `--keep` only label a case.
+    var skip: Set<String> = ["--still", "--screen", "--hold", "--transition", "--keep"]
     if let k = args.firstIndex(of: "--screen"), k + 1 < args.count { skip.insert(args[k + 1]) }
+    let hold = args.firstIndex(of: "--hold").flatMap { $0 + 1 < args.count ? Double(args[$0 + 1]) : nil }
+    if let k = args.firstIndex(of: "--hold"), k + 1 < args.count { skip.insert(args[k + 1]) }
     for path in args[(i + 1)...] where !skip.contains(path) {
         guard let src = NSImage(contentsOfFile: path)?.cgImage(forProposedRect: nil, context: nil, hints: nil) else { print("unreadable:", path); continue }
         var pb: CVPixelBuffer?
@@ -1717,7 +1730,12 @@ if let i = args.firstIndex(of: "--analyze"), i + 1 < args.count,
         ctx.draw(src, in: CGRect(x: 0, y: 0, width: w, height: h))
         CVPixelBufferUnlockBaseAddress(pb!, [])
         var a = Analysis(color: nil, rects: [])
-        for _ in 0...20 { a = s.analyze(pb!, now: t); t += 0.1 }
+        if let hold {
+            let dt = min(0.1, hold)
+            for _ in 0..<max(1, Int((hold / dt).rounded())) { a = s.analyze(pb!, now: t); t += dt }
+        } else {
+            for _ in 0...20 { a = s.analyze(pb!, now: t); t += 0.1 }
+        }
         if args[(i + 1)...].filter({ !skip.contains($0) }).count > 1 { print("after", (path as NSString).lastPathComponent) }
         print("color:", a.color.map(ColorMath.hex) ?? "none")
         for r in a.rects { print("rect:", r) }

@@ -45,3 +45,14 @@ save(fa, 's_full_darkall.png')
 pb = canvas(); pb[band:, 168:1820] = picture(1652, H - band, 4)
 pb[band:band + 130, 168:1820] = (pb[band:band + 130, 168:1820] * 0.1).astype(np.uint8); pb[band:band + 130, 1420:1600] = picture(180, 130, 9)
 d = Image.fromarray(pb); ImageDraw.Draw(d).rounded_rectangle((1885, 1100, 1950, 1160), 12, fill=(235, 235, 235)); save(np.asarray(d), 's_pillar_icon.png')
+# The system's full-screen exit (and entry) animation: the app's picture shrinks toward a window over a dark
+# desktop, one frame per 1/30 s. Its edges move every frame, so no bar may ever be adopted from it.
+wall = np.clip(14 + np.linspace(0, 10, H)[:, None, None] + np.random.default_rng(7).integers(0, 4, (H, W, 1)), 0, 255).astype(np.uint8)
+movie = picture(W, H - band, 11)
+for k in range(15):
+    s = 1 - 0.45 * k / 14
+    w_, h_ = int(W * s), int((H - band) * s)
+    a = np.broadcast_to(wall, (H, W, 3)).copy(); a[:band] = 0
+    x0, y0 = (W - w_) // 2, band + (H - band - h_) // 2
+    a[y0:y0 + h_, x0:x0 + w_] = np.asarray(Image.fromarray(movie).resize((w_, h_)))
+    save(a, f's_exit_{k:02d}.png'); save(a, f's_enter_{14 - k:02d}.png')
