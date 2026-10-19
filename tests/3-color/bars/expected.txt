@@ -1,0 +1,96 @@
+== s_letter
+rect: (0.0, 32.0, 1470.0, 174.0)
+rect: (0.0, 782.0, 1470.0, 174.0)
+== s_letter_esc
+rect: (0.0, 32.0, 1470.0, 174.0)
+rect: (0.0, 782.0, 1470.0, 174.0)
+== s_letter_dark
+== s_letter_darktop
+== s_letter_darkband
+rect: (0.0, 32.0, 1470.0, 320.0)
+rect: (0.0, 636.0, 1470.0, 320.0)
+== s_full
+== s_full_darkedge
+== s_full_darkall
+rect: (0.0, 32.0, 1470.0, 100.0)
+rect: (0.0, 856.0, 1470.0, 100.0)
+== s_pillar_icon
+rect: (0.0, 32.0, 128.0, 924.0)
+rect: (1334.0, 32.0, 136.0, 924.0)
+== s_letter2
+rect: (0.0, 32.0, 1470.0, 174.0)
+rect: (0.0, 784.0, 1470.0, 172.0)
+== s_letter s_letter_darkband s_letter_darktop s_letter_dark s_letter_esc s_letter2
+after s_letter.png
+rect: (0.0, 32.0, 1470.0, 174.0)
+rect: (0.0, 782.0, 1470.0, 174.0)
+after s_letter_darkband.png
+rect: (0.0, 32.0, 1470.0, 174.0)
+rect: (0.0, 782.0, 1470.0, 174.0)
+after s_letter_darktop.png
+rect: (0.0, 32.0, 1470.0, 174.0)
+rect: (0.0, 782.0, 1470.0, 174.0)
+after s_letter_dark.png
+rect: (0.0, 32.0, 1470.0, 174.0)
+rect: (0.0, 782.0, 1470.0, 174.0)
+after s_letter_esc.png
+rect: (0.0, 32.0, 1470.0, 174.0)
+rect: (0.0, 782.0, 1470.0, 174.0)
+after s_letter2.png
+rect: (0.0, 32.0, 1470.0, 174.0)
+rect: (0.0, 782.0, 1470.0, 174.0)
+== s_full s_full_darkedge s_full
+after s_full.png
+after s_full_darkedge.png
+after s_full.png
+== s_letter s_full s_full s_full
+after s_letter.png
+rect: (0.0, 32.0, 1470.0, 174.0)
+rect: (0.0, 782.0, 1470.0, 174.0)
+after s_full.png
+rect: (0.0, 32.0, 1470.0, 174.0)
+rect: (0.0, 782.0, 1470.0, 174.0)
+after s_full.png
+rect: (0.0, 32.0, 1470.0, 174.0)
+rect: (0.0, 782.0, 1470.0, 174.0)
+after s_full.png
+== s_full s_full s_full s_letter s_letter s_letter
+after s_full.png
+after s_full.png
+after s_full.png
+after s_letter.png
+rect: (0.0, 32.0, 1470.0, 174.0)
+rect: (0.0, 782.0, 1470.0, 174.0)
+after s_letter.png
+rect: (0.0, 32.0, 1470.0, 174.0)
+rect: (0.0, 782.0, 1470.0, 174.0)
+after s_letter.png
+rect: (0.0, 32.0, 1470.0, 174.0)
+rect: (0.0, 782.0, 1470.0, 174.0)
+== s_letter_darkband s_letter_darktop s_letter_darktop s_letter_darktop
+after s_letter_darkband.png
+rect: (0.0, 32.0, 1470.0, 320.0)
+rect: (0.0, 636.0, 1470.0, 320.0)
+after s_letter_darktop.png
+rect: (0.0, 32.0, 1470.0, 320.0)
+rect: (0.0, 636.0, 1470.0, 320.0)
+after s_letter_darktop.png
+rect: (0.0, 32.0, 1470.0, 320.0)
+rect: (0.0, 636.0, 1470.0, 320.0)
+after s_letter_darktop.png
+rect: (0.0, 32.0, 1470.0, 172.0)
+rect: (0.0, 784.0, 1470.0, 172.0)
+== s_full_darkall s_full_darkedge s_full_darkedge s_full_darkedge
+after s_full_darkall.png
+rect: (0.0, 32.0, 1470.0, 100.0)
+rect: (0.0, 856.0, 1470.0, 100.0)
+after s_full_darkedge.png
+rect: (0.0, 32.0, 1470.0, 100.0)
+rect: (0.0, 856.0, 1470.0, 100.0)
+after s_full_darkedge.png
+rect: (0.0, 32.0, 1470.0, 100.0)
+rect: (0.0, 856.0, 1470.0, 100.0)
+after s_full_darkedge.png
+== --still s_letter
+== --still s_pillar_icon
+== --still s_letter_darkband

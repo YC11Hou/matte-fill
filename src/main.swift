@@ -137,8 +137,11 @@ enum Palette {
 
 enum Display {
     static func targetScreens(_ cfg: Config) -> [NSScreen] {
-        cfg.displays == "all" ? NSScreen.screens : NSScreen.screens.filter { CGDisplayIsBuiltin(id(of: $0)) != 0 }
+        NSScreen.screens.filter { isTarget(builtin: CGDisplayIsBuiltin(id(of: $0)) != 0, displays: cfg.displays) }
     }
+
+    // Matte runs only on the built-in display unless the user turned on "all" (tests/1-external).
+    static func isTarget(builtin: Bool, displays: String) -> Bool { builtin || displays == "all" }
 
     static func id(of screen: NSScreen) -> CGDirectDisplayID {
         (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
@@ -886,19 +889,21 @@ enum ShotAnalyzer {
 // so Matte must capture nothing while such video plays. Detected without capturing: Chromium browsers
 // decrypt in their own CDM utility processes, whose CPU time only grows while protected video plays.
 final class ProtectedPlayback {
-    private var cdms: [pid_t: [pid_t]] = [:]            // app pid -> its CDM child processes
-    private var listedAt: [pid_t: Double] = [:]
+    private var cdms: [pid_t] = []                       // CDM processes of every browser
+    private var listedAt = -100.0
     private var samples: [pid_t: [(t: Double, cpu: Double)]] = [:]
     private static let timebase: Double = {
         var tb = mach_timebase_info_data_t(); mach_timebase_info(&tb)
         return Double(tb.numer) / Double(tb.denom)
     }()
 
-    // True while the app's CDM has used CPU within the last 2 s (decrypting, i.e. playing).
-    func playing(app: pid_t, now: Double) -> Bool {
-        if now - (listedAt[app] ?? -100) > 5 { cdms[app] = ProtectedPlayback.cdmChildren(of: app); listedAt[app] = now }
+    // True while any browser's CDM, on any display, has used CPU within the last 2 s (decrypting, i.e.
+    // playing): a browser blacks out its protected video whenever any capture runs anywhere, so a movie on
+    // the external display is protected just as much as one on ours.
+    func playing(now: Double) -> Bool {
+        if now - listedAt > 5 { cdms = ProtectedPlayback.cdmProcesses(); listedAt = now }
         var busy = false
-        for pid in cdms[app] ?? [] {
+        for pid in cdms {
             guard let cpu = ProtectedPlayback.cpuSeconds(pid) else { continue }
             var s = samples[pid] ?? []
             s.append((now, cpu)); s.removeAll { now - $0.t > 2.5 }
@@ -908,14 +913,20 @@ final class ProtectedPlayback {
         return busy
     }
 
-    static func cdmChildren(of app: pid_t) -> [pid_t] {
+    // Browser helper processes running the CDM service (Chromium-based browsers alike). Other apps carry a
+    // CDM too (Spotify, for audio) and never black anything out, so only browsers count.
+    static let browsers = ["Google Chrome", "Microsoft Edge", "Brave Browser", "Chromium", "Arc", "Vivaldi", "Opera"]
+    static func isBrowserCDM(_ args: String) -> Bool {
+        args.contains("CdmServiceBroker") && browsers.contains { args.contains("/\($0).app/") }
+    }
+
+    static func cdmProcesses() -> [pid_t] {
         var pids = [pid_t](repeating: 0, count: 8192)
         let n = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size)))
         return pids.prefix(max(0, n)).filter { pid in
-            var info = proc_bsdinfo()
-            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)) > 0,
-                  pid_t(info.pbi_ppid) == app else { return false }
-            return arguments(pid).contains("CdmServiceBroker")
+            var name = [CChar](repeating: 0, count: 256)
+            guard proc_name(pid, &name, UInt32(name.count)) > 0, String(cString: name).contains("Helper") else { return false }
+            return isBrowserCDM(arguments(pid))
         }
     }
 
@@ -1095,6 +1106,7 @@ final class Session {
     var sampling = false
     var native = false
     var probeAt = 0.0
+    var wantLook = false
     var appTitle: String?
     var titleSeen: (title: String, since: Double)?
     var menuBar: MenuBarWatcher?
@@ -1166,10 +1178,10 @@ final class Session {
         else if now < pendingUntil { holdUntil = 0; show(why: "full-screen transition") }
         else if shown, holdUntil == 0 { holdUntil = now + Session.exitHold }
         else if now >= holdUntil { holdUntil = 0; hide() }
-        if shown { watchForExit(now); paceSampling(now); paceMenuBar() }
-        if now - lastDRMCheck >= 0.5, let pid = shown ? appPID : Display.frontApp(on: screen) {
+        if shown { watchForExit(now); paceSampling(now); paceMenuBar(now) }
+        if now - lastDRMCheck >= 0.5 {
             lastDRMCheck = now
-            if drm.playing(app: pid, now: now), shown, !protectedMode { enterProtectedMode() }
+            if drm.playing(now: now), shown, !protectedMode { enterProtectedMode() }
         }
     }
 
@@ -1180,7 +1192,7 @@ final class Session {
     // extension recolors them at the source instead).
     private func enterProtectedMode() {
         protectedMode = true
-        NSLog("matte-fill: [\(screen.localizedName)] protected (DRM) video playing: no capture, notch band in the default color")
+        NSLog("matte-fill: [\(screen.localizedName)] protected (DRM) video playing on some display: no capture, notch band in the default color")
         stopSampling()
         menuBar?.stop()
         bandYielded = false
@@ -1245,7 +1257,7 @@ final class Session {
         // fills the screen and then holds still for 0.5 s; while entering, the window still changes.
         guard let st = steady, st.since == 0 else {
             if settledSpace, let b, fillsScreen(b) {
-                if let st = steady, st.bounds == b { if now - st.since >= 0.5 { steady = (b, 0); if probeAt == 0 { probeAt = now } } }   // 0 marks it settled
+                if let st = steady, st.bounds == b { if now - st.since >= 0.5 { steady = (b, 0) } }   // 0 marks it settled
                 else { steady = (b, now) }
             } else { steady = nil }
             return
@@ -1255,7 +1267,7 @@ final class Session {
             // bars back with the normal ease-in.
             exiting = false; steady = nil
             NSLog("matte-fill: [\(screen.localizedName)] exit cancelled")
-            startSampling()
+            wantLook = true
             return
         }
         if st.since == 0, b != st.bounds, !exiting {
@@ -1263,6 +1275,7 @@ final class Session {
             applyMenuBar()
             NSLog("matte-fill: [\(screen.localizedName)] exit started, bars ease out over \(Session.exitFadeSeconds)s")
             barRects = []
+            barsView?.matte.enabled = false   // capture stops now; a frozen frame must not ride the fade
             barsView?.setRects([], animated: true, duration: Session.exitFadeSeconds)
         }
     }
@@ -1402,7 +1415,7 @@ final class Session {
     private func show(why: String) {
         guard !shown, let bandPanel, let barsPanel else { return }
         shown = true
-        snapNext = true
+        snapNext = false   // the band shows the last color through the transition and eases to the new one
         framesSinceShow = 0
         steady = nil
         exiting = false
@@ -1411,7 +1424,7 @@ final class Session {
         let front = Display.frontApp(on: screen).flatMap { NSRunningApplication(processIdentifier: $0) } ?? NSWorkspace.shared.frontmostApplication
         appPID = front?.processIdentifier
         native = Session.nativelyHandled(front)
-        let protected = appPID.map { drm.playing(app: $0, now: CACurrentMediaTime()) } ?? false
+        let protected = drm.playing(now: CACurrentMediaTime())
         NSLog("matte-fill: [\(screen.localizedName)] show [\(why)]\(native ? " (IINA plugin)" : "") (capture access: \(CGPreflightScreenCaptureAccess()))")
         for p in [bandPanel, barsPanel] { p.setFrame(screen.frame, display: false) }
         shownKey = Display.fullScreenWindowKey(screen)
@@ -1432,7 +1445,25 @@ final class Session {
             return
         }
         appTitle = appPID.flatMap { Session.mainWindow(screen, pid: $0)?.title }
-        startSampling()
+        wantLook = true
+    }
+
+    // The one gate every capture of ours passes (tests/2-animation checks that no other path starts one).
+    // The system's own transitions (zooming into or out of full screen, sliding Spaces) run with no capture
+    // at all, so nothing competes with their frames: capture starts only once the full-screen window has
+    // held still for 0.5 s (legacy full screen: 1 s after showing) and stops the moment an exit begins.
+    // Protected video playing on any display (tests/1-external) allows none either.
+    static func captureAllowed(shown: Bool, protected: Bool, exiting: Bool, settledSpace: Bool, windowSettled: Bool,
+                               legacyFullScreen: Bool, sinceShown: Double) -> Bool {
+        guard shown, !protected, !exiting else { return false }
+        if settledSpace { return windowSettled }
+        return legacyFullScreen && sinceShown >= 1
+    }
+
+    private func calm(_ now: Double) -> Bool {
+        Session.captureAllowed(shown: shown, protected: protectedMode, exiting: exiting, settledSpace: settledSpace,
+                               windowSettled: steady?.since == 0, legacyFullScreen: !settledSpace && Session.pluginFullScreen(on: screen),
+                               sinceShown: now - shownAt)
     }
 
     // Capture runs only while it is needed, since macOS shows its screen-recording indicator for as long as
@@ -1442,9 +1473,9 @@ final class Session {
     static let probeSeconds = 3.0
 
     private func startSampling() {
-        guard shown, !sampling, !protectedMode, let sampler else { return }
+        guard !sampling, calm(CACurrentMediaTime()), let sampler else { return }
         sampling = true
-        probeAt = steady?.since == 0 ? CACurrentMediaTime() : 0   // the look counts from a settled window
+        probeAt = CACurrentMediaTime()
         NSLog("matte-fill: [\(screen.localizedName)] capture on")
         sampler.start()
         if let pid = appPID { sampler.focus(pid: pid) }
@@ -1454,12 +1485,12 @@ final class Session {
     // On a notched display the full-screen menu bar window never moves (it paints the band black while
     // hidden), so only its pixels tell, and they also feed the band's mirror. The strip is watched only
     // while the pointer is at the top of the screen, the one place it drops from, or while it is still out.
-    private func paceMenuBar() {
+    private func paceMenuBar(_ now: Double) {
         guard let menuBar, !protectedMode else { return }
         let p = NSEvent.mouseLocation, f = screen.frame
-        let near = p.x >= f.minX && p.x <= f.maxX && p.y >= f.maxY - bandRect.height - 8 && p.y <= f.maxY
+        let near = calm(now) && p.x >= f.minX && p.x <= f.maxX && p.y >= f.maxY - bandRect.height - 8 && p.y <= f.maxY
         // Keep watching until the strip has been plain black for 0.3 s, so the mirror never freezes on titles.
-        if near || menuBar.visible || CACurrentMediaTime() - menuBar.titlesAt < 0.3 {
+        if near || (calm(now) && (menuBar.visible || now - menuBar.titlesAt < 0.3)) {
             if !menuBar.isRunning { NSLog("matte-fill: [\(screen.localizedName)] menu bar watch on"); menuBar.start() }
         } else if menuBar.isRunning {
             NSLog("matte-fill: [\(screen.localizedName)] menu bar watch off")
@@ -1475,9 +1506,13 @@ final class Session {
     }
 
     private func paceSampling(_ now: Double) {
-        guard !protectedMode, !exiting, let pid = appPID else { return }
+        guard !protectedMode, let pid = appPID else { return }
+        guard calm(now) else { stopSampling(); return }
         if sampling {
-            if !native, barRects.isEmpty, barsView?.matte.enabled != true, probeAt > 0, now - probeAt >= Session.probeSeconds { stopSampling() }
+            if !native, barRects.isEmpty, barsView?.matte.enabled != true, now - probeAt >= Session.probeSeconds { stopSampling() }
+        } else if wantLook {
+            wantLook = false
+            startSampling()
         } else if let st = steady, st.since == 0, let m = Session.mainWindow(screen, pid: pid), m.title != appTitle {
             // The title must hold for 1 s in the unchanged full-screen window: leaving full screen retitles
             // some apps, and the moving exit animation must never be read as a new video's bars.
@@ -1518,7 +1553,7 @@ final class Session {
         barsView?.setRects(rects, animated: cfg.fadeSeconds > 0.01)
         if !rects.isEmpty {
             barsView?.matte.enabled = true
-            if shown, sampling { sampler?.setMirror(true) }
+            if sampling, calm(CACurrentMediaTime()) { sampler?.setMirror(true) }
             return
         }
         // Keep passing the app's UI through until the leaving bars have fully faded out.
@@ -1656,13 +1691,22 @@ if let i = args.firstIndex(of: "--analyze-shot"), i + 1 < args.count {
 
 // Offline self-test: feed screenshots in order, each as 2 simulated seconds of playback, and print what
 // would be painted after each (several files simulate UI appearing, layout changes and so on).
+// `--screen WxHxTOP` fixes the screen geometry and uses the default config, so results don't depend on the
+// displays attached or the local config (tools/check.sh relies on this).
+let fixedScreen: (size: CGSize, top: CGFloat)? = args.firstIndex(of: "--screen").flatMap { k in
+    let v = k + 1 < args.count ? args[k + 1].split(separator: "x").compactMap { Double($0) } : []
+    return v.count == 3 ? (CGSize(width: v[0], height: v[1]), CGFloat(v[2])) : nil
+}
 if let i = args.firstIndex(of: "--analyze"), i + 1 < args.count,
-   let screen = Display.targetScreens(Config.load()).first ?? NSScreen.main {
-    let w = Int(screen.frame.width) / 2, h = Int(screen.frame.height) / 2
-    let s = Sampler(cfg: Config.load(), bandFraction: Double(screen.safeAreaInsets.top / screen.frame.height), screenSize: screen.frame.size)
+   let size = fixedScreen?.size ?? (Display.targetScreens(Config.load()).first ?? NSScreen.main)?.frame.size {
+    let top = fixedScreen?.top ?? (Display.targetScreens(Config.load()).first ?? NSScreen.main)?.safeAreaInsets.top ?? 0
+    let w = Int(size.width) / 2, h = Int(size.height) / 2
+    let s = Sampler(cfg: fixedScreen == nil ? Config.load() : Config(), bandFraction: Double(top / size.height), screenSize: size)
     s.assumeMotion = !args.contains("--still")
     var t = 0.0
-    for path in args[(i + 1)...] where path != "--still" {
+    var skip: Set<String> = ["--still", "--screen"]
+    if let k = args.firstIndex(of: "--screen"), k + 1 < args.count { skip.insert(args[k + 1]) }
+    for path in args[(i + 1)...] where !skip.contains(path) {
         guard let src = NSImage(contentsOfFile: path)?.cgImage(forProposedRect: nil, context: nil, hints: nil) else { print("unreadable:", path); continue }
         var pb: CVPixelBuffer?
         CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, nil, &pb)
@@ -1674,7 +1718,7 @@ if let i = args.firstIndex(of: "--analyze"), i + 1 < args.count,
         CVPixelBufferUnlockBaseAddress(pb!, [])
         var a = Analysis(color: nil, rects: [])
         for _ in 0...20 { a = s.analyze(pb!, now: t); t += 0.1 }
-        if args.count > i + 2 { print("after", (path as NSString).lastPathComponent) }
+        if args[(i + 1)...].filter({ !skip.contains($0) }).count > 1 { print("after", (path as NSString).lastPathComponent) }
         print("color:", a.color.map(ColorMath.hex) ?? "none")
         for r in a.rects { print("rect:", r) }
     }

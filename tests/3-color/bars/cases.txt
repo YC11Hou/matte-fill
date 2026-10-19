@@ -1,0 +1,24 @@
+# One case per line: samples fed in order (each = 2 s of playback) from tools/bars-regression/synth.py.
+# "--still" treats the samples as a static app screen (an editor's dark UI): no bar may ever appear.
+# Single frames
+s_letter
+s_letter_esc
+s_letter_dark
+s_letter_darktop
+s_letter_darkband
+s_full
+s_full_darkedge
+s_full_darkall
+s_pillar_icon
+s_letter2
+# Sequences: UI and dark scenes come and go, the bars hold; a full-frame video drops them
+s_letter s_letter_darkband s_letter_darktop s_letter_dark s_letter_esc s_letter2
+s_full s_full_darkedge s_full
+s_letter s_full s_full s_full
+s_full s_full s_full s_letter s_letter s_letter
+s_letter_darkband s_letter_darktop s_letter_darktop s_letter_darktop
+s_full_darkall s_full_darkedge s_full_darkedge s_full_darkedge
+# Static app screens
+--still s_letter
+--still s_pillar_icon
+--still s_letter_darkband
