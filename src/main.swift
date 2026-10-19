@@ -159,6 +159,20 @@ enum Display {
         return nil
     }
 
+    // Owner of the frontmost normal window over this display's center (the window list runs front to back).
+    static func frontApp(on screen: NSScreen) -> pid_t? {
+        let b = CGDisplayBounds(id(of: screen))
+        let me = ProcessInfo.processInfo.processIdentifier
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        for w in list where (w[kCGWindowLayer as String] as? Int) == 0 {
+            guard let pid = w[kCGWindowOwnerPID as String] as? Int32, pid != me,
+                  let bd = w[kCGWindowBounds as String] as? NSDictionary, let r = CGRect(dictionaryRepresentation: bd),
+                  r.contains(CGPoint(x: b.midX, y: b.midY)) else { continue }
+            return pid
+        }
+        return nil
+    }
+
     // Height of the area the system menu bar paints on this display: the camera housing plus the menu
     // bar's own 1 pt bottom line (its window is 33 pt where safeAreaInsets.top is 32). Zero without a notch.
     static func menuBarHeight(_ screen: NSScreen) -> CGFloat {
@@ -239,72 +253,51 @@ final class OverlayPanel: NSPanel {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 }
 
-// The notch band: one plain fill over exactly the camera-housing area, where the menu bar itself
-// paints black. It never reaches into the app's content.
-final class BandView: NSView {
-    private let band = CALayer()
-    override var isFlipped: Bool { true }
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        wantsLayer = true
-        layer = CALayer()
-        band.actions = ["backgroundColor": NSNull(), "frame": NSNull()]
-        layer!.addSublayer(band)
+// Wherever the system paints black under something that has to stay visible (menu titles over the notch
+// band, player UI over the bars), the black is replaced the same way: a live copy of the screen is
+// screen-blended over the fill (out = src + (1 - src) * fill), so black becomes exactly the fill while
+// text, icons and their anti-aliased edges stay intact. The band and the bars share this one component.
+final class MirrorFill {
+    private var fills: [CALayer] = [], mirrors: [CALayer] = []
+    private var held: [CVPixelBuffer] = []
+    var enabled = false { didSet { if enabled != oldValue { show() } } }
+
+    // A fill and its mirror inside `parent`, both covering `frame` (the mirror shows the whole capture).
+    func add(to parent: CALayer, frame: CGRect) {
+        let fill = CALayer(), mirror = CALayer()
+        for l in [fill, mirror] { l.frame = frame; l.actions = ["backgroundColor": NSNull(), "frame": NSNull(), "contents": NSNull()] }
+        mirror.contentsGravity = .resize
+        mirror.filters = [MirrorFill.blackLevel(), MirrorFill.clampToRange()]
+        mirror.compositingFilter = CIFilter(name: "CIScreenBlendMode")
+        parent.addSublayer(fill); parent.addSublayer(mirror)
+        fills.append(fill); mirrors.append(mirror)
     }
-    required init?(coder: NSCoder) { fatalError() }
+
+    func setFrame(_ r: CGRect) {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        for l in fills + mirrors { l.frame = r }
+        CATransaction.commit()
+    }
 
     func setColor(_ c: CGColor) {
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        band.backgroundColor = c
+        for f in fills { f.backgroundColor = c }
         CATransaction.commit()
     }
 
-    func setBand(_ r: CGRect) { band.frame = r }
+    // Keeps the latest captured frame even while hidden (a static screen sends no new frames), and
+    // retains the last few buffers so capture never reuses a surface that is still on screen.
+    func setMirror(_ px: CVPixelBuffer?) {
+        if let px { held.append(px); if held.count > 3 { held.removeFirst() } } else { held = [] }
+        show()
+    }
 
-    // Yields to the menu bar when the pointer reaches the top, at the menu bar's own pace.
-    func setBandVisible(_ v: Bool) {
-        guard (band.opacity > 0.5) != v else { return }
-        CATransaction.begin(); CATransaction.setAnimationDuration(0.18)
-        band.opacity = v ? 1 : 0
+    private func show() {
+        let surface = enabled ? held.last.flatMap { CVPixelBufferGetIOSurface($0)?.takeUnretainedValue() } : nil
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        for m in mirrors { m.contents = surface }
         CATransaction.commit()
     }
-}
-
-// The bars are not cut around player UI: a live copy of the app is screen-blended over the fill
-// (out = src + (1 - src) * fill), so pure black becomes exactly the fill, while titles, controls and
-// their anti-aliased edges stay intact. One persistent tile per edge, so every change (appearing,
-// leaving, resizing) is an eased transition rather than a jump.
-final class BarsView: NSView {
-    enum Edge: CaseIterable { case top, bottom, left, right }
-    private struct Tile { let clip: CALayer, fill: CALayer, mirror: CALayer; var rect: CGRect? }
-    private var tiles: [Edge: Tile] = [:]
-    private var held: [CVPixelBuffer] = []
-    var fadeSeconds = 2.5
-    private var span = 2.5
-    var mirrorEnabled = false { didSet { showMirror() } }
-    override var isFlipped: Bool { true }
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        wantsLayer = true
-        layerUsesCoreImageFilters = true
-        layer = CALayer()
-        for e in Edge.allCases {
-            let clip = CALayer(), fill = CALayer(), mirror = CALayer()
-            // The clip's bounds origin always equals its frame origin, so its sublayers stay in screen
-            // coordinates while the clip itself moves or resizes.
-            clip.masksToBounds = true
-            clip.opacity = 0
-            fill.frame = bounds
-            mirror.frame = bounds
-            mirror.contentsGravity = .resize
-            mirror.filters = [BarsView.blackLevel(), BarsView.clampToRange()]
-            mirror.compositingFilter = CIFilter(name: "CIScreenBlendMode")
-            clip.addSublayer(fill); clip.addSublayer(mirror)
-            layer!.addSublayer(clip)
-            tiles[e] = Tile(clip: clip, fill: fill, mirror: mirror, rect: nil)
-        }
-    }
-    required init?(coder: NSCoder) { fatalError() }
 
     // Compressed video black is rarely 0 (it sits around 10-20), so the mirror's black level is pulled
     // down before the screen blend; otherwise encoded bars would end up a shade lighter than the band.
@@ -327,6 +320,67 @@ final class BarsView: NSView {
         f.setValue(CIVector(x: 1, y: 1, z: 1, w: 1), forKey: "inputMaxComponents")
         return f
     }
+}
+
+// The notch band: exactly the camera-housing area, where the menu bar itself paints black, never
+// reaching into the app's content. A dropped-down menu bar keeps its titles and icons over the fill.
+final class BandView: NSView {
+    private let band = CALayer()
+    let matte = MirrorFill()
+    override var isFlipped: Bool { true }
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layerUsesCoreImageFilters = true
+        layer = CALayer()
+        band.masksToBounds = true
+        band.actions = ["frame": NSNull()]
+        matte.add(to: band, frame: .zero)
+        layer!.addSublayer(band)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func setBand(_ r: CGRect) {
+        band.frame = r
+        matte.setFrame(CGRect(origin: .zero, size: r.size))
+    }
+
+    // Yields to a menu bar that brings a background of its own, at the menu bar's own pace.
+    func setBandVisible(_ v: Bool) {
+        guard (band.opacity > 0.5) != v else { return }
+        CATransaction.begin(); CATransaction.setAnimationDuration(0.18)
+        band.opacity = v ? 1 : 0
+        CATransaction.commit()
+    }
+}
+
+// The bars: one persistent tile per edge, each a clip over the shared MirrorFill, so every change
+// (appearing, leaving, resizing) is an eased transition rather than a jump.
+final class BarsView: NSView {
+    enum Edge: CaseIterable { case top, bottom, left, right }
+    private struct Tile { let clip: CALayer; var rect: CGRect? }
+    private var tiles: [Edge: Tile] = [:]
+    let matte = MirrorFill()
+    var fadeSeconds = 2.5
+    private var span = 2.5
+    override var isFlipped: Bool { true }
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layerUsesCoreImageFilters = true
+        layer = CALayer()
+        for e in Edge.allCases {
+            // The clip's bounds origin always equals its frame origin, so its sublayers stay in screen
+            // coordinates while the clip itself moves or resizes.
+            let clip = CALayer()
+            clip.masksToBounds = true
+            clip.opacity = 0
+            matte.add(to: clip, frame: bounds)
+            layer!.addSublayer(clip)
+            tiles[e] = Tile(clip: clip, rect: nil)
+        }
+    }
+    required init?(coder: NSCoder) { fatalError() }
 
     private func edge(of r: CGRect) -> Edge {
         if r.width >= bounds.width - 1 { return r.midY < bounds.midY ? .top : .bottom }
@@ -378,26 +432,6 @@ final class BarsView: NSView {
         a.duration = span
         a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
         l.add(a, forKey: key)
-    }
-
-    // Keeps the latest captured frame even while hidden (a static screen sends no new frames), and
-    // retains the last few buffers so capture never reuses a surface that is still on screen.
-    func setMirror(_ px: CVPixelBuffer?) {
-        if let px { held.append(px); if held.count > 3 { held.removeFirst() } } else { held = [] }
-        showMirror()
-    }
-
-    private func showMirror() {
-        let surface = mirrorEnabled ? held.last.flatMap { CVPixelBufferGetIOSurface($0)?.takeUnretainedValue() } : nil
-        CATransaction.begin(); CATransaction.setDisableActions(true)
-        for t in tiles.values { t.mirror.contents = surface }
-        CATransaction.commit()
-    }
-
-    func setColor(_ c: CGColor) {
-        CATransaction.begin(); CATransaction.setDisableActions(true)
-        for t in tiles.values { t.fill.backgroundColor = c }
-        CATransaction.commit()
     }
 }
 
@@ -903,11 +937,17 @@ final class ProtectedPlayback {
 // MARK: - Menu bar watcher
 
 // Watches what lies under the notch band (our own windows excluded): while the full-screen menu bar is
-// hidden that strip is the system's plain black; once the menu bar slides in, its background and items
-// show up there. The band yields exactly then, never on a guess from the pointer position.
+// hidden that strip is the system's plain black. A menu bar on black only adds titles and icons, which
+// the band shows through its mirror; the band yields only to a menu bar with a background of its own,
+// never on a guess from the pointer position.
 final class MenuBarWatcher: NSObject, SCStreamOutput, SCStreamDelegate {
     var onChange: ((Bool) -> Void)?
+    var onFrame: ((CVPixelBuffer) -> Void)?
+    private var resetAt: UInt64 = 0
     private(set) var visible = false
+    var isRunning: Bool { running }
+    private(set) var titlesAt = 0.0   // last time anything at all (titles, icons) lit the strip
+    private var lastLit = false
     private var stream: SCStream?
     private var running = false
     private var blackFrames = 0
@@ -929,13 +969,15 @@ final class MenuBarWatcher: NSObject, SCStreamOutput, SCStreamDelegate {
             let pid = ProcessInfo.processInfo.processIdentifier
             let mine = content.windows.filter { $0.owningApplication?.processID == pid }
             let conf = SCStreamConfiguration()
+            let scale = Double(CGDisplayCopyDisplayMode(displayID)?.pixelWidth ?? display.width * 2) / Double(display.width)
             conf.sourceRect = CGRect(x: 0, y: 0, width: CGFloat(display.width), height: height)
-            conf.width = display.width / 4
-            conf.height = max(4, Int(height / 4))
-            conf.minimumFrameInterval = CMTime(value: 1, timescale: 20)
+            conf.width = Int((Double(display.width) * scale).rounded())
+            conf.height = Int((Double(height) * scale).rounded())
+            conf.minimumFrameInterval = CMTime(value: 1, timescale: 60)
             conf.pixelFormat = kCVPixelFormatType_32BGRA
+            conf.colorSpaceName = CGColorSpace.sRGB
             conf.showsCursor = false
-            conf.queueDepth = 3
+            conf.queueDepth = 6
             let s = SCStream(filter: SCContentFilter(display: display, excludingWindows: mine), configuration: conf, delegate: self)
             do { try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.queue) } catch { return }
             DispatchQueue.main.async {
@@ -948,7 +990,8 @@ final class MenuBarWatcher: NSObject, SCStreamOutput, SCStreamDelegate {
     // Forget what was seen so far (it may have been the desktop's menu bar during a Space switch);
     // showing then needs two lit frames in a row.
     func reset() {
-        queue.async { self.blackFrames = 0; self.litFrames = 0; self.lastSeen = nil }
+        let t = mach_absolute_time()
+        queue.async { self.blackFrames = 0; self.litFrames = 0; self.lastSeen = nil; self.resetAt = t }
         if visible { visible = false; onChange?(false) }
     }
 
@@ -961,6 +1004,7 @@ final class MenuBarWatcher: NSObject, SCStreamOutput, SCStreamDelegate {
     func stop() {
         guard running else { return }
         running = false
+        titlesAt = 0
         stream?.stopCapture { _ in }
         if visible { visible = false; onChange?(false) }
     }
@@ -972,9 +1016,13 @@ final class MenuBarWatcher: NSObject, SCStreamOutput, SCStreamDelegate {
         // A static strip arrives as image-less idle frames: they repeat the last observation, otherwise the
         // black count stalls after the menu bar hides and the band never comes back.
         guard let px = CMSampleBufferGetImageBuffer(sb) else {
-            if Self.status(sb) == .idle, lastSeen != nil { tally(lastSeen!) }
+            if Self.status(sb) == .idle, lastSeen != nil { tally(lastSeen!); note(lastLit) }
             return
         }
+        // Frames shown before the last reset may still be the desktop's menu bar.
+        let shownAt = (CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]])?
+            .first?[.displayTime] as? UInt64 ?? 0
+        if shownAt >= resetAt { DispatchQueue.main.async { if self.running { self.onFrame?(px) } } }
         CVPixelBufferLockBaseAddress(px, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(px, .readOnly) }
         guard let base = CVPixelBufferGetBaseAddress(px) else { return }
@@ -982,15 +1030,23 @@ final class MenuBarWatcher: NSObject, SCStreamOutput, SCStreamDelegate {
         let p = base.assumingMemoryBound(to: UInt8.self)
         var lit = 0, n = 0
         for side in sides {
-            for x in Int(side.lowerBound * Double(w))..<Int(side.upperBound * Double(w)) {
-                for y in 0..<h {
+            for x in stride(from: Int(side.lowerBound * Double(w)), to: Int(side.upperBound * Double(w)), by: 4) {
+                for y in stride(from: 0, to: h, by: 4) {
                     let o = y * st + x * 4
                     if max(p[o], p[o + 1], p[o + 2]) > 24 { lit += 1 }
                     n += 1
                 }
             }
         }
-        tally(n > 0 && Double(lit) / Double(n) >= 0.03)
+        // Titles on black light a few percent of the strip; a menu bar background lights most of it.
+        let share = n > 0 ? Double(lit) / Double(n) : 0
+        tally(share >= 0.6)
+        // Titles and icons light about 1% or more; a privacy dot (camera, microphone) a few hundredths.
+        lastLit = share >= 0.003
+        note(lastLit)
+        if FileManager.default.fileExists(atPath: Config.dir.appendingPathComponent("debug").path) {
+            NSLog("matte-fill: menu bar strip lit \(String(format: "%.4f", share))")
+        }
     }
 
     private static func status(_ sb: CMSampleBuffer) -> SCFrameStatus? {
@@ -999,12 +1055,17 @@ final class MenuBarWatcher: NSObject, SCStreamOutput, SCStreamDelegate {
         return SCFrameStatus(rawValue: raw)
     }
 
-    // Shows after 2 lit frames in a row; hides after 3 plain-black frames, so it never flickers.
+    // Shows after 0.1 s of lit frames; hides after 0.15 s of plain black (60 fps), so it never flickers.
+    private func note(_ lit: Bool) {
+        guard lit else { return }
+        DispatchQueue.main.async { if self.running { self.titlesAt = CACurrentMediaTime() } }
+    }
+
     private func tally(_ seen: Bool) {
         lastSeen = seen
         blackFrames = seen ? 0 : blackFrames + 1
         litFrames = seen ? litFrames + 1 : 0
-        let v = litFrames >= 2 || (visible && blackFrames < 3)
+        let v = litFrames >= 6 || (visible && blackFrames < 9)
         DispatchQueue.main.async {
             guard self.running, v != self.visible else { return }
             self.visible = v
@@ -1094,6 +1155,7 @@ final class Session {
         let settled = reason == "native full-screen space"
         if settled && !settledSpace {
             menuBar?.reset()   // only frames from the full-screen Space count
+            bandView?.matte.setMirror(nil)
             if shown { pin() }
         }
         settledSpace = settled
@@ -1105,7 +1167,7 @@ final class Session {
         else if shown, holdUntil == 0 { holdUntil = now + Session.exitHold }
         else if now >= holdUntil { holdUntil = 0; hide() }
         if shown { watchForExit(now); paceSampling(now); paceMenuBar() }
-        if now - lastDRMCheck >= 0.5, let pid = shown ? appPID : NSWorkspace.shared.frontmostApplication?.processIdentifier {
+        if now - lastDRMCheck >= 0.5, let pid = shown ? appPID : Display.frontApp(on: screen) {
             lastDRMCheck = now
             if drm.playing(app: pid, now: now), shown, !protectedMode { enterProtectedMode() }
         }
@@ -1123,10 +1185,11 @@ final class Session {
         menuBar?.stop()
         bandYielded = false
         bandView?.setBandVisible(true)
+        bandView?.matte.enabled = false
         target = ColorMath.fromHex(cfg.fallbackColor)
         snapNext = false
         if !barRects.isEmpty { applyBars([]) }
-        barsView?.mirrorEnabled = false
+        barsView?.matte.enabled = false
     }
 
     // Space handling, measured frame by frame (2026-10-11): the system's slide into a new full-screen
@@ -1273,7 +1336,7 @@ final class Session {
         let bp = makePanel(level: Int(CGWindowLevelForKey(.mainMenuWindow)) + 1)
         let bv = BandView(frame: NSRect(origin: .zero, size: f.size))
         bp.contentView = bv
-        bv.setColor(ColorMath.cgColor(current))
+        bv.matte.setColor(ColorMath.cgColor(current))
         bandRect = CGRect(x: 0, y: 0, width: f.width, height: Display.menuBarHeight(screen))
         NSLog("matte-fill: [\(screen.localizedName)] notch band height \(bandRect.height) (safe area \(screen.safeAreaInsets.top))")
         bv.setBand(bandRect)
@@ -1281,11 +1344,12 @@ final class Session {
         let rv = BarsView(frame: NSRect(origin: .zero, size: f.size))
         rv.fadeSeconds = cfg.fadeSeconds
         rp.contentView = rv
-        rv.setColor(ColorMath.cgColor(current))
+        rv.matte.setColor(ColorMath.cgColor(current))
         bandPanel = bp; barsPanel = rp; bandView = bv; barsView = rv
         if bandRect.height > 0 {
             let m = MenuBarWatcher(screen: screen)
             m.onChange = { [weak self] _ in self?.applyMenuBar() }
+            m.onFrame = { [weak bv] px in bv?.matte.setMirror(px) }
             m.prepare(displayID: displayID, height: bandRect.height)
             menuBar = m
         }
@@ -1304,7 +1368,7 @@ final class Session {
                 if !self.exiting, a.rects != self.barRects { self.applyBars(a.rects) }
                 if let k = self.shownKey, self.framesSinceShow > 3 { self.barCache[k] = a.rects }
             }
-            s.onMirror = { [weak self] px in self?.barsView?.setMirror(px) }
+            s.onMirror = { [weak self] px in self?.barsView?.matte.setMirror(px) }
             sampler = s
             let did = displayID, wid = CGWindowID(bp.windowNumber)
             s.onLost = { [weak s] in s?.prepare(displayID: did, excludeWindowID: wid) }
@@ -1317,7 +1381,9 @@ final class Session {
     private func applyMenuBar() {
         guard !protectedMode else { return }
         let now = CACurrentMediaTime()
-        let seen = (menuBar?.visible ?? false) && settledSpace && steady?.since == 0 && !exiting
+        let own = settledSpace && steady?.since == 0 && !exiting
+        bandView?.matte.enabled = own
+        let seen = (menuBar?.visible ?? false) && own
         if !seen { menuSeenAt = 0 } else if menuSeenAt == 0 { menuSeenAt = now }
         // The menu bar must stay out for 0.15 s: leaving full screen flashes it for a frame or two.
         let yield = seen && now - menuSeenAt >= 0.15
@@ -1329,8 +1395,8 @@ final class Session {
 
     private func setColor(_ c: OKLab) {
         let cg = ColorMath.cgColor(c)
-        bandView?.setColor(cg)
-        barsView?.setColor(cg)
+        bandView?.matte.setColor(cg)
+        barsView?.matte.setColor(cg)
     }
 
     private func show(why: String) {
@@ -1340,7 +1406,9 @@ final class Session {
         framesSinceShow = 0
         steady = nil
         exiting = false
-        let front = NSWorkspace.shared.frontmostApplication
+        // The app going full screen on this display, not the frontmost app: with two displays the user
+        // may be working in another app on the other one.
+        let front = Display.frontApp(on: screen).flatMap { NSRunningApplication(processIdentifier: $0) } ?? NSWorkspace.shared.frontmostApplication
         appPID = front?.processIdentifier
         native = Session.nativelyHandled(front)
         let protected = appPID.map { drm.playing(app: $0, now: CACurrentMediaTime()) } ?? false
@@ -1384,13 +1452,19 @@ final class Session {
     }
 
     // On a notched display the full-screen menu bar window never moves (it paints the band black while
-    // hidden), so only its pixels tell; the strip is watched only while the pointer is at the top of the
-    // screen, the one place it drops from, or while it is still out.
+    // hidden), so only its pixels tell, and they also feed the band's mirror. The strip is watched only
+    // while the pointer is at the top of the screen, the one place it drops from, or while it is still out.
     private func paceMenuBar() {
         guard let menuBar, !protectedMode else { return }
         let p = NSEvent.mouseLocation, f = screen.frame
         let near = p.x >= f.minX && p.x <= f.maxX && p.y >= f.maxY - bandRect.height - 8 && p.y <= f.maxY
-        if near || menuBar.visible { menuBar.start() } else { menuBar.stop() }
+        // Keep watching until the strip has been plain black for 0.3 s, so the mirror never freezes on titles.
+        if near || menuBar.visible || CACurrentMediaTime() - menuBar.titlesAt < 0.3 {
+            if !menuBar.isRunning { NSLog("matte-fill: [\(screen.localizedName)] menu bar watch on"); menuBar.start() }
+        } else if menuBar.isRunning {
+            NSLog("matte-fill: [\(screen.localizedName)] menu bar watch off")
+            menuBar.stop(); bandView?.matte.setMirror(nil)
+        }
     }
 
     private func stopSampling() {
@@ -1403,7 +1477,7 @@ final class Session {
     private func paceSampling(_ now: Double) {
         guard !protectedMode, !exiting, let pid = appPID else { return }
         if sampling {
-            if !native, barRects.isEmpty, barsView?.mirrorEnabled != true, probeAt > 0, now - probeAt >= Session.probeSeconds { stopSampling() }
+            if !native, barRects.isEmpty, barsView?.matte.enabled != true, probeAt > 0, now - probeAt >= Session.probeSeconds { stopSampling() }
         } else if let st = steady, st.since == 0, let m = Session.mainWindow(screen, pid: pid), m.title != appTitle {
             // The title must hold for 1 s in the unchanged full-screen window: leaving full screen retitles
             // some apps, and the moving exit animation must never be read as a new video's bars.
@@ -1426,13 +1500,15 @@ final class Session {
         menuBar?.stop()
         bandYielded = false
         bandView?.setBandVisible(true)
+        bandView?.matte.enabled = false
+        bandView?.matte.setMirror(nil)
         bandPanel?.orderOut(nil); barsPanel?.orderOut(nil)
         bandPanel?.alphaValue = 0; barsPanel?.alphaValue = 0
         unpin()
         barRects = []
         barsView?.setRects([], animated: false)
-        barsView?.mirrorEnabled = false
-        barsView?.setMirror(nil)
+        barsView?.matte.enabled = false
+        barsView?.matte.setMirror(nil)
     }
 
     // Bars ease in, out and between sizes (BarsView); the mirror runs only while some bar is painted.
@@ -1441,14 +1517,14 @@ final class Session {
         barRects = rects
         barsView?.setRects(rects, animated: cfg.fadeSeconds > 0.01)
         if !rects.isEmpty {
-            barsView?.mirrorEnabled = true
+            barsView?.matte.enabled = true
             if shown, sampling { sampler?.setMirror(true) }
             return
         }
         // Keep passing the app's UI through until the leaving bars have fully faded out.
         DispatchQueue.main.asyncAfter(deadline: .now() + cfg.fadeSeconds) { [weak self] in
             guard let self, self.barRects.isEmpty else { return }
-            self.barsView?.mirrorEnabled = false
+            self.barsView?.matte.enabled = false
             self.sampler?.setMirror(false)
         }
     }
@@ -1615,7 +1691,7 @@ if args.contains("--preview"), let screen = Display.targetScreens(Config.load())
     p.setFrame(screen.frame, display: false)
     let v = BarsView(frame: NSRect(origin: .zero, size: screen.frame.size))
     p.contentView = v
-    v.setColor(ColorMath.cgColor(ColorMath.fromHex("#C04040")))
+    v.matte.setColor(ColorMath.cgColor(ColorMath.fromHex("#C04040")))
     v.setRects([CGRect(x: 0, y: screen.safeAreaInsets.top, width: screen.frame.width, height: 100)], animated: false)
     p.orderFrontRegardless()
     DispatchQueue.main.asyncAfter(deadline: .now() + 2) { exit(0) }
