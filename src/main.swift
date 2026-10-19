@@ -429,6 +429,9 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
     private var display: SCDisplay?
     private var startedAt = 0.0
     private var dbgStrict: [Int] = []
+    private var sig: [Int] = []
+    private var motion: [(t: Double, moved: Bool)] = []
+    var assumeMotion = false   // offline stills stand in for playing video
 
     init(cfg: Config, bandFraction: Double, screenSize: CGSize) {
         self.cfg = cfg
@@ -518,7 +521,7 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
         if running { prepared?.stopCapture { _ in } }
         running = false
         setMirror(false)
-        queue.async { self.est = [0, 0, 0, 0]; self.cand = [(0, 0), (0, 0)]; self.pend = [(-1, 0), (-1, 0), (-1, 0), (-1, 0)]; self.frameNo = 0; self.startedAt = 0 }
+        queue.async { self.est = [0, 0, 0, 0]; self.cand = [(0, 0), (0, 0)]; self.pend = [(-1, 0), (-1, 0), (-1, 0), (-1, 0)]; self.frameNo = 0; self.startedAt = 0; self.sig = []; self.motion = [] }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -573,7 +576,23 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
             return max(Int(p[o]), Int(p[o + 1]), Int(p[o + 2]))
         }
 
-        if cfg.coverBars && barsEnabled { updateBars(w: w, h: h, y0: y0, now: now, dark: dark, level: level) }
+        // Bars only exist around playing video: an app's own dark UI (an editor, a terminal) can look just
+        // like one, but holds still. So a first bar needs the picture to have been moving for the last second:
+        // most of a coarse 16x9 grid of cell means changing from frame to frame, not a cursor or a spinner.
+        var cells: [Int] = []
+        for gy in 0..<9 {
+            for gx in 0..<16 {
+                var sum = 0
+                for sy in 0..<4 { for sx in 0..<4 { sum += level((gx * 4 + sx) * w / 64, y0 + (gy * 4 + sy) * (h - y0) / 36) } }
+                cells.append(sum)
+            }
+        }
+        let moved = sig.count == cells.count && zip(sig, cells).filter { abs($0 - $1) >= 48 }.count >= 4
+        sig = cells
+        motion.append((now, moved))
+        motion.removeAll { now - $0.t > 1 }
+        let moving = assumeMotion || (motion.count >= 5 && Double(motion.filter(\.moved).count) >= 0.5 * Double(motion.count))
+        if cfg.coverBars && barsEnabled { updateBars(w: w, h: h, y0: y0, now: now, moving: moving, dark: dark, level: level) }
         else { est = [0, 0, 0, 0] }
         let (t, b, l, r) = (est[0], est[1], est[2], est[3])
 
@@ -603,7 +622,7 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
     // video's frame rarely changes while its scenes do: a refinement of a sample or two needs 1 s of
     // agreement, anything larger 5 s, and a first bar found after 8 s (UI hid it until then) 5 s too.
     // Only the color follows the scenes.
-    private func updateBars(w: Int, h: Int, y0: Int, now: Double, dark: (Int, Int) -> Bool, level: (Int, Int) -> Int) {
+    private func updateBars(w: Int, h: Int, y0: Int, now: Double, moving: Bool, dark: (Int, Int) -> Bool, level: (Int, Int) -> Int) {
         if size != (w, h) { size = (w, h); est = [0, 0, 0, 0] }
         let ch = h - y0
         let caps = [ch * 35 / 100 + 2, ch * 35 / 100 + 2, w * 35 / 100 + 2, w * 35 / 100 + 2]
@@ -714,7 +733,7 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
                 let c = d0 + d1
                 if abs(c - cand[pair].0) > 2 { cand[pair] = (c, now) }
-                if c > 0, now - cand[pair].1 >= (!locked ? 0 : now - startedAt < 8 ? 0.25 : 5) { est[e0] = d0; est[e1] = d1 }
+                if c > 0, moving, now - cand[pair].1 >= (!locked ? 0 : now - startedAt < 8 ? 0.25 : 5) { est[e0] = d0; est[e1] = d1 }
                 continue
             }
             for e in [e0, e1] {
@@ -1012,6 +1031,11 @@ final class Session {
     var barRects: [CGRect] = []
     var snapNext = true
     var framesSinceShow = 0
+    var sampling = false
+    var native = false
+    var probeAt = 0.0
+    var appTitle: String?
+    var titleSeen: (title: String, since: Double)?
     var menuBar: MenuBarWatcher?
     var barCache: [String: [CGRect]] = [:]
     var fsSpaces = 0
@@ -1080,7 +1104,7 @@ final class Session {
         else if now < pendingUntil { holdUntil = 0; show(why: "full-screen transition") }
         else if shown, holdUntil == 0 { holdUntil = now + Session.exitHold }
         else if now >= holdUntil { holdUntil = 0; hide() }
-        if shown { watchForExit(now) }
+        if shown { watchForExit(now); paceSampling(now); paceMenuBar() }
         if now - lastDRMCheck >= 0.5, let pid = shown ? appPID : NSWorkspace.shared.frontmostApplication?.processIdentifier {
             lastDRMCheck = now
             if drm.playing(app: pid, now: now), shown, !protectedMode { enterProtectedMode() }
@@ -1095,7 +1119,7 @@ final class Session {
     private func enterProtectedMode() {
         protectedMode = true
         NSLog("matte-fill: [\(screen.localizedName)] protected (DRM) video playing: no capture, notch band in the default color")
-        sampler?.stop()
+        stopSampling()
         menuBar?.stop()
         bandYielded = false
         bandView?.setBandVisible(true)
@@ -1158,7 +1182,7 @@ final class Session {
         // fills the screen and then holds still for 0.5 s; while entering, the window still changes.
         guard let st = steady, st.since == 0 else {
             if settledSpace, let b, fillsScreen(b) {
-                if let st = steady, st.bounds == b { if now - st.since >= 0.5 { steady = (b, 0) } }   // 0 marks it settled
+                if let st = steady, st.bounds == b { if now - st.since >= 0.5 { steady = (b, 0); if probeAt == 0 { probeAt = now } } }   // 0 marks it settled
                 else { steady = (b, now) }
             } else { steady = nil }
             return
@@ -1168,6 +1192,7 @@ final class Session {
             // bars back with the normal ease-in.
             exiting = false; steady = nil
             NSLog("matte-fill: [\(screen.localizedName)] exit cancelled")
+            startSampling()
             return
         }
         if st.since == 0, b != st.bounds, !exiting {
@@ -1185,17 +1210,19 @@ final class Session {
         return r.minX <= d.minX + 1 && r.maxX >= d.maxX - 1 && r.maxY >= d.maxY - 1 && r.minY <= d.minY + bandRect.height + 1
     }
 
-    // Bounds of the full-screen app's largest on-screen window that covers most of this display.
-    static func mainWindowBounds(_ screen: NSScreen, pid: pid_t) -> CGRect? {
+    // The full-screen app's largest on-screen window that covers most of this display.
+    static func mainWindow(_ screen: NSScreen, pid: pid_t) -> (bounds: CGRect, title: String)? {
         let d = CGDisplayBounds(Display.id(of: screen))
         let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-        return list.compactMap { w -> CGRect? in
+        return list.compactMap { w -> (bounds: CGRect, title: String)? in
             guard (w[kCGWindowOwnerPID as String] as? Int32) == pid, (w[kCGWindowLayer as String] as? Int) == 0,
                   let bd = w[kCGWindowBounds as String] as? NSDictionary, let r = CGRect(dictionaryRepresentation: bd),
                   r.intersection(d).width * r.intersection(d).height >= 0.8 * d.width * d.height else { return nil }
-            return r
-        }.max { $0.width * $0.height < $1.width * $1.height }
+            return (r, w[kCGWindowName as String] as? String ?? "")
+        }.max { $0.bounds.width * $0.bounds.height < $1.bounds.width * $1.bounds.height }
     }
+
+    static func mainWindowBounds(_ screen: NSScreen, pid: pid_t) -> CGRect? { mainWindow(screen, pid: pid)?.bounds }
 
     // Leaving full screen, the Space switches ~0.2 s before the system's slide starts drawing (a
     // snapshot that still holds our colors); staying that long hands over to it without a black frame.
@@ -1265,7 +1292,7 @@ final class Session {
         if cfg.adaptive || cfg.coverBars {
             let s = Sampler(cfg: cfg, bandFraction: Double(screen.safeAreaInsets.top / f.height), screenSize: f.size)
             s.onAnalysis = { [weak self] a in
-                guard let self, self.shown, !self.protectedMode else { return }   // no stale frames once capture stopped
+                guard let self, self.shown, self.sampling else { return }   // no stale frames once capture stopped
                 if self.framesSinceShow == 0 || (self.framesSinceShow == 25) {
                     NSLog("matte-fill: [\(self.screen.localizedName)] frame \(self.framesSinceShow) color=\(a.color.map(ColorMath.hex) ?? "-") bars=\(a.rects.count) rects \(a.rects.first.map { "first=\($0)" } ?? "")")
                 }
@@ -1315,7 +1342,7 @@ final class Session {
         exiting = false
         let front = NSWorkspace.shared.frontmostApplication
         appPID = front?.processIdentifier
-        let native = Session.nativelyHandled(front)
+        native = Session.nativelyHandled(front)
         let protected = appPID.map { drm.playing(app: $0, now: CACurrentMediaTime()) } ?? false
         NSLog("matte-fill: [\(screen.localizedName)] show [\(why)]\(native ? " (IINA plugin)" : "") (capture access: \(CGPreflightScreenCaptureAccess()))")
         for p in [bandPanel, barsPanel] { p.setFrame(screen.frame, display: false) }
@@ -1336,9 +1363,56 @@ final class Session {
             enterProtectedMode()
             return
         }
-        sampler?.start()
-        menuBar?.start()
-        if let pid = front?.processIdentifier { sampler?.focus(pid: pid) }
+        appTitle = appPID.flatMap { Session.mainWindow(screen, pid: $0)?.title }
+        startSampling()
+    }
+
+    // Capture runs only while it is needed, since macOS shows its screen-recording indicator for as long as
+    // any runs: video (bars painted, or IINA's plugin) keeps it live; any other full-screen app gets a short
+    // look for its color and bars, then capture stops. A new window title (another page, another file)
+    // takes a fresh look.
+    static let probeSeconds = 3.0
+
+    private func startSampling() {
+        guard shown, !sampling, !protectedMode, let sampler else { return }
+        sampling = true
+        probeAt = steady?.since == 0 ? CACurrentMediaTime() : 0   // the look counts from a settled window
+        NSLog("matte-fill: [\(screen.localizedName)] capture on")
+        sampler.start()
+        if let pid = appPID { sampler.focus(pid: pid) }
+        if !barRects.isEmpty { sampler.setMirror(true) }
+    }
+
+    // On a notched display the full-screen menu bar window never moves (it paints the band black while
+    // hidden), so only its pixels tell; the strip is watched only while the pointer is at the top of the
+    // screen, the one place it drops from, or while it is still out.
+    private func paceMenuBar() {
+        guard let menuBar, !protectedMode else { return }
+        let p = NSEvent.mouseLocation, f = screen.frame
+        let near = p.x >= f.minX && p.x <= f.maxX && p.y >= f.maxY - bandRect.height - 8 && p.y <= f.maxY
+        if near || menuBar.visible { menuBar.start() } else { menuBar.stop() }
+    }
+
+    private func stopSampling() {
+        guard sampling else { return }
+        sampling = false
+        NSLog("matte-fill: [\(screen.localizedName)] capture off")
+        sampler?.stop()
+    }
+
+    private func paceSampling(_ now: Double) {
+        guard !protectedMode, !exiting, let pid = appPID else { return }
+        if sampling {
+            if !native, barRects.isEmpty, barsView?.mirrorEnabled != true, probeAt > 0, now - probeAt >= Session.probeSeconds { stopSampling() }
+        } else if let st = steady, st.since == 0, let m = Session.mainWindow(screen, pid: pid), m.title != appTitle {
+            // The title must hold for 1 s in the unchanged full-screen window: leaving full screen retitles
+            // some apps, and the moving exit animation must never be read as a new video's bars.
+            guard m.bounds == st.bounds else { titleSeen = nil; return }
+            if titleSeen?.title != m.title { titleSeen = (m.title, now) }
+            guard now - titleSeen!.since >= 1 else { return }
+            appTitle = m.title; titleSeen = nil
+            startSampling()
+        } else { titleSeen = nil }
     }
 
     func hide() {
@@ -1348,7 +1422,7 @@ final class Session {
         exiting = false
         steady = nil
         NSLog("matte-fill: [\(screen.localizedName)] hide (last color \(ColorMath.hex(current)))")
-        sampler?.stop()
+        stopSampling()
         menuBar?.stop()
         bandYielded = false
         bandView?.setBandVisible(true)
@@ -1368,7 +1442,7 @@ final class Session {
         barsView?.setRects(rects, animated: cfg.fadeSeconds > 0.01)
         if !rects.isEmpty {
             barsView?.mirrorEnabled = true
-            if shown { sampler?.setMirror(true) }
+            if shown, sampling { sampler?.setMirror(true) }
             return
         }
         // Keep passing the app's UI through until the leaving bars have fully faded out.
@@ -1510,8 +1584,9 @@ if let i = args.firstIndex(of: "--analyze"), i + 1 < args.count,
    let screen = Display.targetScreens(Config.load()).first ?? NSScreen.main {
     let w = Int(screen.frame.width) / 2, h = Int(screen.frame.height) / 2
     let s = Sampler(cfg: Config.load(), bandFraction: Double(screen.safeAreaInsets.top / screen.frame.height), screenSize: screen.frame.size)
+    s.assumeMotion = !args.contains("--still")
     var t = 0.0
-    for path in args[(i + 1)...] {
+    for path in args[(i + 1)...] where path != "--still" {
         guard let src = NSImage(contentsOfFile: path)?.cgImage(forProposedRect: nil, context: nil, hints: nil) else { print("unreadable:", path); continue }
         var pb: CVPixelBuffer?
         CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, nil, &pb)
