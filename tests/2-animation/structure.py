@@ -88,6 +88,15 @@ check("Session.captureAllowed(" in calm and "protectedMode" in calm and "exiting
 for cls in ["Sampler", "MenuBarWatcher"]:
     check("if self.running" in body(cls, "prepare"), f"{cls}.prepare starts capture only if start() was already called")
 
+print("menu bar")
+amb = body("Session", "applyMenuBar")
+check("Session.menuBarYield(" in amb, "applyMenuBar decides through Session.menuBarYield (unit-tested)")
+check("protectedMode else { return }" not in amb, "applyMenuBar still runs in protected mode: the band must yield there too")
+pmb = body("Session", "paceMenuBar")
+check(pmb.count("calm(") >= 1 and pmb.count("calm(") == pmb.count("calm(now, strip: true)"),
+      "every gate check in paceMenuBar is the strip gate: the menu bar is watched once the Space has switched, without waiting for the window")
+check("Display.fullScreenOwner(" in body("Session", "watchForExit"), "the full-screen app is taken from the window filling the display, after the Space switch")
+
 print("windows and displays")
 panels = body("Session", "makePanels")
 check("makePanel(level: Int(CGWindowLevelForKey(.mainMenuWindow)) + 1)" in panels, "notch band window: main menu + 1")

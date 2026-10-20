@@ -176,6 +176,20 @@ enum Display {
         return nil
     }
 
+    // Owner of the frontmost normal window that covers most of this display (a full-screen window).
+    static func fullScreenOwner(_ screen: NSScreen) -> pid_t? {
+        let d = CGDisplayBounds(id(of: screen))
+        let me = ProcessInfo.processInfo.processIdentifier
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        for w in list where (w[kCGWindowLayer as String] as? Int) == 0 {
+            guard let pid = w[kCGWindowOwnerPID as String] as? Int32, pid != me,
+                  let bd = w[kCGWindowBounds as String] as? NSDictionary, let r = CGRect(dictionaryRepresentation: bd),
+                  r.intersection(d).width * r.intersection(d).height >= 0.8 * d.width * d.height else { continue }
+            return pid
+        }
+        return nil
+    }
+
     // Height of the area the system menu bar paints on this display: the camera housing plus the menu
     // bar's own 1 pt bottom line (its window is 33 pt where safeAreaInsets.top is 32). Zero without a notch.
     static func menuBarHeight(_ screen: NSScreen) -> CGFloat {
@@ -1113,6 +1127,8 @@ final class Session {
     let drm = ProtectedPlayback()
     var lastDRMCheck = 0.0
     var menuSeenAt = 0.0
+    var pointerTopAt = 0.0
+    var pointerAwayAt = 0.0
     var knownFS = Set<UInt64>()
     var pinned = false
     var memberSpaces = Set<UInt64>()
@@ -1247,6 +1263,12 @@ final class Session {
     // The app's full-screen window, once its bounds have held still for 0.5 s, is the steady state; any
     // later change in it (the system's exit animation replaces or resizes it) starts the exit.
     private func watchForExit(_ now: Double) {
+        // The full-screen app is the owner of the window filling this display once the Space has switched;
+        // at the start of the transition the window under the display's center may still be another app's.
+        if settledSpace, steady == nil, let owner = Display.fullScreenOwner(screen), owner != appPID {
+            NSLog("matte-fill: [\(screen.localizedName)] full-screen app is pid \(owner)")
+            appPID = owner
+        }
         let b = appPID.flatMap { Session.mainWindowBounds(screen, pid: $0) }
         // Learning: only once the system has switched to the full-screen Space, and only a window that
         // fills the screen and then holds still for 0.5 s; while entering, the window still changes.
@@ -1387,18 +1409,34 @@ final class Session {
     // The band yields only to the full-screen Space's own menu bar: while the system is still switching
     // Spaces (entering or leaving) the strip shows the desktop's menu bar, and the band stays put.
     private func applyMenuBar() {
-        guard !protectedMode else { return }
         let now = CACurrentMediaTime()
-        let own = settledSpace && steady?.since == 0 && !exiting
-        bandView?.matte.enabled = own
+        let own = settledSpace && !exiting
+        bandView?.matte.enabled = own && !protectedMode
         let seen = (menuBar?.visible ?? false) && own
         if !seen { menuSeenAt = 0 } else if menuSeenAt == 0 { menuSeenAt = now }
-        // The menu bar must stay out for 0.15 s: leaving full screen flashes it for a frame or two.
-        let yield = seen && now - menuSeenAt >= 0.15
+        let p = NSEvent.mouseLocation, f = screen.frame
+        let top = own && p.x >= f.minX && p.x <= f.maxX && p.y >= f.maxY - 2 && p.y <= f.maxY + 1
+        let below = !(p.x >= f.minX && p.x <= f.maxX && p.y >= f.maxY - bandRect.height - 4)
+        if !top { pointerTopAt = 0 } else if pointerTopAt == 0 { pointerTopAt = now }
+        if !below { pointerAwayAt = 0 } else if pointerAwayAt == 0 { pointerAwayAt = now }
+        let yield = Session.menuBarYield(watching: menuBar?.isRunning == true, background: seen && now - menuSeenAt >= 0.15,
+                                         pointerTopFor: pointerTopAt == 0 ? 0 : now - pointerTopAt,
+                                         pointerAwayFor: pointerAwayAt == 0 ? 0 : now - pointerAwayAt, yielded: bandYielded)
         guard yield != bandYielded else { return }
         bandYielded = yield
         NSLog("matte-fill: [\(screen.localizedName)] \(yield ? "menu bar shown, band yields" : "band back")")
         bandView?.setBandVisible(!yield)
+    }
+
+    // The band never keeps the menu bar covered. While the strip is watched, the band stays and mirrors
+    // the menu bar's titles over the fill, yielding only to a menu bar with a background of its own (held
+    // 0.15 s: leaving full screen flashes it for a frame or two). When it can't be watched (protected video
+    // allows no capture), the pointer decides: resting 0.4 s at the very top, where the full-screen menu bar
+    // drops from, the band yields; it comes back 1 s after the pointer has left the menu bar area.
+    static func menuBarYield(watching: Bool, background: Bool, pointerTopFor: Double, pointerAwayFor: Double, yielded: Bool) -> Bool {
+        if watching { return background }
+        if yielded { return pointerAwayFor < 1 }
+        return pointerTopFor >= 0.4
     }
 
     private func setColor(_ c: OKLab) {
@@ -1455,9 +1493,11 @@ final class Session {
         return legacyFullScreen && sinceShown >= 1
     }
 
-    private func calm(_ now: Double) -> Bool {
+    // `strip`: the menu bar watcher's capture, which needs only the Space switch done (the menu bar must be
+    // watched even while an app's full-screen window keeps changing); the sampler also waits for the window.
+    private func calm(_ now: Double, strip: Bool = false) -> Bool {
         Session.captureAllowed(shown: shown, protected: protectedMode, exiting: exiting, settledSpace: settledSpace,
-                               windowSettled: steady?.since == 0, legacyFullScreen: !settledSpace && Session.pluginFullScreen(on: screen),
+                               windowSettled: strip || steady?.since == 0, legacyFullScreen: !settledSpace && Session.pluginFullScreen(on: screen),
                                sinceShown: now - shownAt)
     }
 
@@ -1483,9 +1523,9 @@ final class Session {
     private func paceMenuBar(_ now: Double) {
         guard let menuBar, !protectedMode else { return }
         let p = NSEvent.mouseLocation, f = screen.frame
-        let near = calm(now) && p.x >= f.minX && p.x <= f.maxX && p.y >= f.maxY - bandRect.height - 8 && p.y <= f.maxY
+        let near = calm(now, strip: true) && p.x >= f.minX && p.x <= f.maxX && p.y >= f.maxY - bandRect.height - 8 && p.y <= f.maxY
         // Keep watching until the strip has been plain black for 0.3 s, so the mirror never freezes on titles.
-        if near || (calm(now) && (menuBar.visible || now - menuBar.titlesAt < 0.3)) {
+        if near || (calm(now, strip: true) && (menuBar.visible || now - menuBar.titlesAt < 0.3)) {
             if !menuBar.isRunning { NSLog("matte-fill: [\(screen.localizedName)] menu bar watch on"); menuBar.start() }
         } else if menuBar.isRunning {
             NSLog("matte-fill: [\(screen.localizedName)] menu bar watch off")

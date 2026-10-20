@@ -62,4 +62,15 @@ func runColor() {
     check(px(150, 25) == (255, 255, 255), "4. a subtitle in the bar stays white")
     check(px(50, 150) == (0, 0, 0), "4. nothing is painted outside the bar")
     check(near(px(50, 40), F, 0), "4/1. bars and band share one fill, exactly")
+
+    print("menu bar never covered")
+    func y(watching: Bool = false, bg: Bool = false, top: Double = 0, away: Double = 0, was: Bool = false) -> Bool {
+        Session.menuBarYield(watching: watching, background: bg, pointerTopFor: top, pointerAwayFor: away, yielded: was)
+    }
+    check(!y(watching: true), "watched, titles only: the band stays and mirrors them over the fill")
+    check(y(watching: true, bg: true), "watched, a menu bar with its own background: the band yields")
+    check(y(top: 0.5), "not watchable (protected video): pointer resting at the top yields the band")
+    check(!y(top: 0.2), "not watchable: the pointer merely passing the top doesn't")
+    check(y(away: 0.5, was: true), "not watchable, yielded: stays yielded while the pointer is near the menu bar")
+    check(!y(away: 1.2, was: true), "not watchable: the band comes back 1 s after the pointer left")
 }
