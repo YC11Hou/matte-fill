@@ -20,6 +20,9 @@ rect: (1334.0, 32.0, 136.0, 924.0)
 == s_letter2
 rect: (0.0, 32.0, 1470.0, 174.0)
 rect: (0.0, 784.0, 1470.0, 172.0)
+== s_short_bubble
+rect: (0.0, 32.0, 1470.0, 56.0)
+rect: (0.0, 902.0, 1470.0, 54.0)
 == s_letter s_letter_darkband s_letter_darktop s_letter_dark s_letter_esc s_letter2
 after s_letter.png
 rect: (0.0, 32.0, 1470.0, 174.0)
@@ -91,6 +94,16 @@ after s_full_darkedge.png
 rect: (0.0, 32.0, 1470.0, 100.0)
 rect: (0.0, 856.0, 1470.0, 100.0)
 after s_full_darkedge.png
+== s_short_bubble s_short_bubble s_short
+after s_short_bubble.png
+rect: (0.0, 32.0, 1470.0, 56.0)
+rect: (0.0, 902.0, 1470.0, 54.0)
+after s_short_bubble.png
+rect: (0.0, 32.0, 1470.0, 56.0)
+rect: (0.0, 902.0, 1470.0, 54.0)
+after s_short.png
+rect: (0.0, 32.0, 1470.0, 56.0)
+rect: (0.0, 902.0, 1470.0, 54.0)
 == --still s_letter
 == --still s_pillar_icon
 == --still s_letter_darkband

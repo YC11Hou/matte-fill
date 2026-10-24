@@ -56,3 +56,11 @@ for k in range(15):
     x0, y0 = (W - w_) // 2, band + (H - band - h_) // 2
     a[y0:y0 + h_, x0:x0 + w_] = np.asarray(Image.fromarray(movie).resize((w_, h_)))
     save(a, f's_exit_{k:02d}.png'); save(a, f's_enter_{14 - k:02d}.png')
+# Chrome's "press Esc to exit full screen" bubble for the first ~4 s: a flat gray panel with a bright rim and
+# text, centered, starting just below the screen edge and reaching past a thin (~50 pt) bar into the picture
+TS = 68
+sl = canvas(); sl[band + TS:H - TS] = picture(W, H - band - 2 * TS, 12); save(sl, 's_short.png')
+d = Image.fromarray(sl.copy()); g = ImageDraw.Draw(d)
+g.rounded_rectangle((700, band + 14, 1300, band + 80), 14, fill=(42, 42, 42), outline=(250, 250, 250), width=2)
+g.text((860, band + 40), "Press  Esc  to exit full screen", fill=(255, 255, 255))
+save(np.asarray(d), 's_short_bubble.png')

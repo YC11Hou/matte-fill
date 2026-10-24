@@ -737,8 +737,9 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
             return Double(best) >= share * Double(max(1, runs[e].count))
         }
         // Where picture shows through shallower than depth d: lines meeting textured picture right at the
-        // screen edge (4% unbroken; UI floats inside a bar, never touching the edge), or a straight picture
-        // edge at one depth held to the same 10% as any edge (icons in a bar are shorter).
+        // screen edge (within 2 samples, 4% unbroken; UI floats inside a bar a few points below the edge, like
+        // Chrome's Esc bubble), or a straight picture edge at one depth held to the same 10% as any edge (icons
+        // in a bar are shorter).
         func through(_ e: Int, _ d: Int) -> Int? {
             func picture(_ ls: [(d: Int, i: Int)], _ share: Double) -> Bool {
                 guard ls.count >= 4, continuous(e, ls.map(\.i), share) else { return false }
@@ -752,7 +753,7 @@ final class Sampler: NSObject, SCStreamOutput, SCStreamDelegate {
                 return (sq / n - m * m).squareRoot() >= 6
             }
             let edge = max(1, lens[e] / 50)
-            if picture(pics[e].filter { $0.d < edge }, 0.04) { return 0 }
+            if picture(pics[e].filter { $0.d < 2 }, 0.04) { return 0 }
             for k in Swift.stride(from: edge, to: d - 2, by: 1) where picture(votes[e].filter { abs($0.d - k) <= 1 }, 0.1) { return k }
             return nil
         }

@@ -11,6 +11,7 @@ s_full_darkedge
 s_full_darkall
 s_pillar_icon
 s_letter2
+s_short_bubble
 # Sequences: UI and dark scenes come and go, the bars hold; a full-frame video drops them
 s_letter s_letter_darkband s_letter_darktop s_letter_dark s_letter_esc s_letter2
 s_full s_full_darkedge s_full
@@ -18,6 +19,8 @@ s_letter s_full s_full s_full
 s_full s_full s_full s_letter s_letter s_letter
 s_letter_darkband s_letter_darktop s_letter_darktop s_letter_darktop
 s_full_darkall s_full_darkedge s_full_darkedge s_full_darkedge
+# Chrome's Esc bubble at entry over a thin bar: the top bar holds from the start, not 5 s after it goes
+s_short_bubble s_short_bubble s_short
 # Static app screens
 --still s_letter
 --still s_pillar_icon
